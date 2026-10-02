@@ -23,6 +23,7 @@ class PostReference:
 
 
 _SHORTCODE = re.compile(r"^[A-Za-z0-9_-]{5,64}$")
+_USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 _ROUTES = {"p": "post", "reel": "reel"}
 
 
@@ -46,8 +47,13 @@ def parse_post_url(value: str) -> PostReference:
         raise PostURLParseError("Unsupported Instagram URL port")
 
     path = [segment for segment in parts.path.split("/") if segment]
+    if len(path) == 3 and path[1].lower() in _ROUTES and _USERNAME.fullmatch(path[0]):
+        path = path[1:]
     if len(path) != 2 or path[0].lower() not in _ROUTES:
-        raise UnsupportedContentType("Supported URL paths are /p/<shortcode> and /reel/<shortcode>")
+        raise UnsupportedContentType(
+            "Supported URL paths are /p/<shortcode>, /reel/<shortcode>, and "
+            "/<username>/<p|reel>/<shortcode>"
+        )
 
     route, shortcode = path[0].lower(), path[1]
     if not _SHORTCODE.fullmatch(shortcode):

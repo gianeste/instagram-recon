@@ -1,6 +1,6 @@
 # Instagram operation catalog and fixture status
 
-**Updated:** 2026-10-01  
+**Updated:** 2026-10-02
 **Boundary:** one bounded seven-page REST sequence reached natural exhaustion on 2026-10-01. The recorded GraphQL HTTP 429 remains restricted and was not retried.
 
 This catalog records request observations, not stable API contracts. One imported child-comment response, one genuine browser-observed root shape, and one bounded two-page REST sequence are available; terminal and complete-coverage semantics remain fail-closed.
@@ -12,9 +12,33 @@ This catalog records request observations, not stable API contracts. One importe
 | `PolarisSearchBoxRefetchableQuery` | User supplied an authenticated browser request description for `POST /api/graphql`, search term `samsung`, `context=blended`, `search_surface=web_top_search`, and `include_reel=true`. No response was retained. | `query` is a search-term input. `context`, `search_surface`, and `include_reel` are candidate behavior inputs; their actual effects are untested. Request/session state and transport fields are not result filters. | YES | NO | NO | NO | NO |
 | `GET /api/v1/media/{media_id}/comments/` | User supplied an authorized-browser cURL shape. A bounded Python run observed seven JSON pages, six advancing `min_id` continuations, and a terminal page. | `media_id` identifies the media; `can_support_threading`, `permalink_enabled`, and opaque `min_id`/`max_id` state are semantic inputs. The sequence returned 93 unique IDs with zero overlap; page 7 had both continuation flags false and no cursor. | YES | YES (seven JSON pages) | YES (reviewed mapping) | YES (headload transition and terminal response) | NO |
 | `PolarisPostChildCommentsQuery` | User reports observing this reply operation. Observed `doc_id`: `28027289793632076`; a supplied `tree.txt` response artifact has the matching child-comment connection shape, but its request metadata was not retained. | `media_id`, `parent_comment_id`, `after`, `before`, `first`, `last`, and `is_chronological`. Pagination and chronological semantics have not been measured. | YES | YES (fixture; request linkage unverified) | YES (fixture mapping) | NO | NO |
+| `GET /api/v1/media/{media_id}/comments/{comment_id}/child_comments/` | User-reported authorized-browser request shape from a separate post/account; no corresponding response body or metadata capture is available in this checkout. | `media_id`, `comment_id`, `min_id` (initially empty), `is_chronological=true`, and `paging_direction=view_more`. Keep its IDs/session separate from `Dd6m2a6Exca`. | YES (reported request) | NO | NO | NO | NO |
 | `PolarisPostCommentsPaginationQuery` | User supplied a comments GraphQL request; the client made one initial-page request. | `media_id`, `after`, `before`, `first`, `last`, and `sort_order` are request variables. The captured continuation included opaque state that is not copied here. | YES | YES (429, zero bytes) | NO | NO | NO |
 
 For search, no category is confirmed: users, hashtags, places, posts, Reels, other types, and suggestions are all unobserved. There is no captured submit/navigation sequence to establish whether the search-box operation is followed by a different content-discovery operation. Pagination and ranking are likewise unknown.
+
+### REST child-comments request evidence (2026-10-02)
+
+The reported request path and query shape are recorded above. The historical
+`instagram_private_api` implementation documents the same path, expects
+`child_comments` and `parent_comment`, and checks
+`has_more_tail_child_comments` plus `next_max_child_cursor`; it describes 20
+replies per page and passes pagination kwargs to the endpoint. Its method
+documentation names `max_id` for pagination. This is historical corroboration,
+not a current response or support guarantee. The reported empty `min_id` and
+`paging_direction=view_more` do not establish how that older cursor maps to
+the current request.
+
+No local JSON fixture or response event for this REST child path is available.
+The existing browser view exposes the post UI but not HTTP response bodies, and
+no reply request was triggered for this separate post/account. Therefore the
+current response content type/classification, authentication acceptance,
+`child_comments` records, parent links, and actual continuation fields remain
+unobserved. The REST child schema and pagination are not validated, and no
+adapter or SQLite checkpoint changes are justified. Do not combine this
+request's unknown IDs/session with the `Dd6m2a6Exca` qualification data.
+
+Historical reference: [instagram_private_api `comment_replies`](https://github.com/ping/instagram_private_api/blob/master/instagram_private_api/endpoints/media.py).
 
 ### Reviewed child-response fixture
 

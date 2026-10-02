@@ -9,6 +9,21 @@ from .storage import utc_now
 REQUESTED_COMMENT_FIELDS = {
     "id", "text", "username", "timestamp", "like_count", "hidden", "parent_id", "reply_count",
 }
+_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def decode_shortcode(shortcode: str) -> str:
+    """Return the decimal media ID encoded by an Instagram shortcode."""
+    if not shortcode:
+        raise ValueError("shortcode is required")
+    media_id = 0
+    for character in shortcode:
+        try:
+            digit = _SHORTCODE_ALPHABET.index(character)
+        except ValueError:
+            raise ValueError("shortcode contains an invalid character") from None
+        media_id = media_id * 64 + digit
+    return str(media_id)
 
 
 def _field_status(raw: dict[str, Any], name: str, requested: set[str]) -> str:
@@ -51,19 +66,25 @@ def normalize_comment(
     requested_fields: set[str] | None = None,
 ) -> dict[str, Any]:
     comment_id = raw.get("id")
-    if not isinstance(comment_id, (str, int)) or not str(comment_id):
+    if isinstance(comment_id, bool) or not isinstance(comment_id, (str, int)) or not str(comment_id):
         raise ValueError("Comment response item did not include an id")
     author = raw.get("from") if isinstance(raw.get("from"), dict) else {}
     reported_replies = raw.get("reply_count", raw.get("replies_count"))
+    if isinstance(reported_replies, bool) or not isinstance(reported_replies, int) or reported_replies < 0:
+        reported_replies = None
     replies = raw.get("replies")
     if reported_replies is None and isinstance(replies, dict):
-        total = replies.get("summary", {}).get("total_count")
-        reported_replies = total if isinstance(total, int) else None
+        summary = replies.get("summary")
+        total = summary.get("total_count") if isinstance(summary, dict) else None
+        reported_replies = total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else None
+    normalized_parent = parent_id if parent_id is not None else raw.get("parent_id")
+    if isinstance(normalized_parent, bool) or not isinstance(normalized_parent, (str, int, type(None))):
+        raise ValueError("Comment response parent ID has an invalid type")
     return {
         "id": str(comment_id),
-        "media_id": media_id,
-        "parent_id": parent_id or raw.get("parent_id"),
-        "author_id": str(author["id"]) if author.get("id") is not None else None,
+        "media_id": str(media_id),
+        "parent_id": str(normalized_parent) if normalized_parent is not None else None,
+        "author_id": str(author["id"]) if isinstance(author.get("id"), (str, int)) and not isinstance(author.get("id"), bool) else None,
         "username": raw.get("username") or author.get("username"),
         "text": raw.get("text"),
         "created_at": _timestamp_utc(raw.get("timestamp")),
@@ -76,5 +97,6 @@ def normalize_comment(
             for key in ("id", "text", "username", "timestamp", "like_count", "hidden", "parent_id", "reply_count")
         },
         "source": source,
+        "source_operation": source,
         "collected_at": utc_now(),
     }

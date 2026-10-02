@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,12 @@ def _merge(old: Any, new: Any) -> Any:
             merged[key] = _merge(old.get(key), value) if key in old else value
         return merged
     return new
+
+
+_COMMENT_CHANGE_FIELDS = (
+    "author_id", "username", "text", "created_at", "timestamp_raw",
+    "like_count", "reported_reply_count", "visibility",
+)
 
 
 class StateStore:
@@ -165,15 +172,17 @@ class StateStore:
                 """,
                 (media_id, shortcode, _json(post), _json(author), now),
             )
-    def begin_run(self, run_id: str, scan_id: str, media_id: str, mode: str) -> None:
+    def begin_run(self, run_id: str, scan_id: str, media_id: str, mode: str) -> str:
+        started_at = utc_now()
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO collection_runs(run_id, scan_id, media_id, started_at, mode)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (run_id, scan_id, media_id, utc_now(), mode),
+                (run_id, scan_id, media_id, started_at, mode),
             )
+        return started_at
 
     def finish_run(self, run_id: str, report: dict[str, Any]) -> None:
         with self.connection:
@@ -188,14 +197,17 @@ class StateStore:
         media_id: str,
         post: dict[str, Any],
         author: dict[str, Any],
+        *,
+        observed_at: str | None = None,
     ) -> None:
+        observed_at = observed_at or utc_now()
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO post_observations(media_id, run_id, observed_at, post_json, author_json)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (media_id, run_id, utc_now(), _json(post), _json(author)),
+                (media_id, run_id, observed_at, _json(post), _json(author)),
             )
 
     def checkpoint(self, media_id: str, edge: str, parent_id: str | None = None) -> dict[str, Any] | None:
@@ -212,6 +224,7 @@ class StateStore:
             "after_cursor": row["after_cursor"],
             "complete": bool(row["complete"]),
             "pages": row["pages"],
+            "last_successful_page": row["pages"],
             "termination_reason": row["termination_reason"],
         }
 
@@ -247,10 +260,23 @@ class StateStore:
                 ),
             )
 
-    def reset_checkpoints(self, media_id: str) -> None:
+    def reset_checkpoints(
+        self, media_id: str, edge: str | None = None, parent_id: str | None = None
+    ) -> None:
         with self.connection:
-            self.connection.execute("DELETE FROM checkpoints WHERE media_id = ?", (media_id,))
-            self.connection.execute("DELETE FROM seen_cursors WHERE media_id = ?", (media_id,))
+            if edge is None:
+                self.connection.execute("DELETE FROM checkpoints WHERE media_id = ?", (media_id,))
+                self.connection.execute("DELETE FROM seen_cursors WHERE media_id = ?", (media_id,))
+            else:
+                parent_key = parent_id or ""
+                self.connection.execute(
+                    "DELETE FROM checkpoints WHERE media_id = ? AND edge = ? AND parent_key = ?",
+                    (media_id, edge, parent_key),
+                )
+                self.connection.execute(
+                    "DELETE FROM seen_cursors WHERE media_id = ? AND edge = ? AND parent_key = ?",
+                    (media_id, edge, parent_key),
+                )
 
     def save_page(
         self,
@@ -272,7 +298,10 @@ class StateStore:
         complete = not has_next
         after_cursor: str | None = None
 
-        with self.connection:
+        transaction_started = time.perf_counter()
+        record_started = transaction_started
+        self.connection.execute("BEGIN")
+        try:
             previous = self.connection.execute(
                 """
                 SELECT pages FROM checkpoints
@@ -283,19 +312,30 @@ class StateStore:
             pages = (previous["pages"] if previous else 0) + 1
 
             for record in records:
-                comment_id = str(record.get("id") or "")
-                if not comment_id:
+                raw_id = record.get("id")
+                if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id):
                     raise ValueError("comment response item is missing id")
+                comment_id = str(raw_id)
+                if str(record.get("media_id")) != media_id:
+                    raise ValueError("comment media ID does not match the saved page")
+                record_parent = record.get("parent_id")
+                if record_parent is None:
+                    record_parent = parent_id
+                if record_parent is not None:
+                    record_parent = str(record_parent)
+                if parent_id is not None and record_parent != str(parent_id):
+                    raise ValueError("comment parent ID does not match the saved branch")
                 existing = self.connection.execute(
-                    "SELECT data_json FROM comments WHERE media_id = ? AND comment_id = ?",
+                    "SELECT parent_id, data_json FROM comments WHERE media_id = ? AND comment_id = ?",
                     (media_id, comment_id),
                 ).fetchone()
                 if existing:
+                    if existing["parent_id"] != record_parent:
+                        raise ValueError("comment ID was observed with a conflicting parent ID")
                     duplicates += 1
                     merged = _merge(json.loads(existing["data_json"]), record)
                 else:
                     merged = record
-                record_parent = record.get("parent_id") or parent_id
                 self.connection.execute(
                     """
                     INSERT INTO comments(
@@ -318,6 +358,8 @@ class StateStore:
                     (media_id, run_id, scan_id, comment_id, record_parent, now, _json(record)),
                 )
 
+            record_ms = (time.perf_counter() - record_started) * 1000
+            checkpoint_started = time.perf_counter()
             if has_next:
                 if not next_cursor:
                     reason = "missing_cursor"
@@ -359,6 +401,14 @@ class StateStore:
                 """,
                 (media_id, edge, parent_key, after_cursor, int(complete), pages, reason, now),
             )
+            checkpoint_ms = (time.perf_counter() - checkpoint_started) * 1000
+            commit_started = time.perf_counter()
+            self.connection.commit()
+            commit_ms = (time.perf_counter() - commit_started) * 1000
+        except BaseException:
+            self.connection.rollback()
+            raise
+        transaction_ms = (time.perf_counter() - transaction_started) * 1000
 
         return {
             "duplicates": duplicates,
@@ -366,6 +416,12 @@ class StateStore:
             "after_cursor": after_cursor,
             "pages": pages,
             "termination_reason": reason,
+            "timings_ms": {
+                "record_persistence_and_deduplication": round(record_ms, 3),
+                "checkpoint": round(checkpoint_ms, 3),
+                "commit": round(commit_ms, 3),
+                "transaction": round(transaction_ms, 3),
+            },
         }
 
     def comments(
@@ -440,7 +496,7 @@ class StateStore:
     def latest_run(self, media_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             """
-            SELECT run_id, scan_id, ended_at, report_json FROM collection_runs
+            SELECT run_id, scan_id, started_at, ended_at, mode, report_json FROM collection_runs
             WHERE media_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
             """,
             (media_id,),
@@ -450,8 +506,151 @@ class StateStore:
         return {
             "run_id": row["run_id"],
             "scan_id": row["scan_id"],
+            "started_at": row["started_at"],
             "ended_at": row["ended_at"],
+            "mode": row["mode"],
             "report": json.loads(row["report_json"]) if row["report_json"] else None,
+        }
+
+    def latest_successful_run(self, media_id: str, mode: str | None = None) -> dict[str, Any] | None:
+        rows = self.connection.execute(
+            """
+            SELECT run_id, scan_id, started_at, ended_at, mode, report_json
+            FROM collection_runs
+            WHERE media_id = ? AND ended_at IS NOT NULL AND report_json IS NOT NULL
+              AND (? IS NULL OR mode = ?)
+            ORDER BY started_at DESC, rowid DESC
+            """,
+            (media_id, mode, mode),
+        )
+        for row in rows:
+            report = json.loads(row["report_json"])
+            if report.get("root_protocol_complete") is True:
+                return {
+                    "run_id": row["run_id"],
+                    "scan_id": row["scan_id"],
+                    "started_at": row["started_at"],
+                    "ended_at": row["ended_at"],
+                    "mode": row["mode"],
+                }
+        return None
+
+    def reported_count_history(self, media_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT r.run_id, r.scan_id, r.started_at, r.ended_at, r.mode,
+                   p.observed_at, p.post_json, r.report_json
+            FROM collection_runs r
+            LEFT JOIN post_observations p ON p.run_id = r.run_id
+            WHERE r.media_id = ?
+            ORDER BY r.started_at, r.rowid, p.observation_id
+            """,
+            (media_id,),
+        )
+        history = []
+        seen_observations: set[tuple[int, str]] = set()
+        for row in rows:
+            report = json.loads(row["report_json"]) if row["report_json"] else {}
+            post = json.loads(row["post_json"]) if row["post_json"] else {}
+            reported_count = post.get("comment_count")
+            if not isinstance(reported_count, int) or isinstance(reported_count, bool):
+                reported_count = report.get("reported_comment_count")
+            if not isinstance(reported_count, int) or isinstance(reported_count, bool):
+                continue
+            report_only = not isinstance(post.get("comment_count"), int) or isinstance(post.get("comment_count"), bool)
+            performance = report.get("performance")
+            if report_only and isinstance(performance, dict) and performance.get("root_requests_this_run") == 0:
+                continue
+            observed_at = (
+                report.get("collected_at") or row["ended_at"] if report_only
+                else post.get("comment_count_observed_at") or row["observed_at"] or row["ended_at"]
+            )
+            timestamp_basis = (
+                "run_report_proxy" if report_only
+                else
+                "response_payload" if post.get("comment_count_observed_at")
+                else "post_observation_snapshot" if row["post_json"] is not None
+                else "run_end_proxy"
+            )
+            if observed_at is not None:
+                observation = (reported_count, observed_at)
+                if observation in seen_observations:
+                    continue
+                seen_observations.add(observation)
+            history.append({
+                "run_id": row["run_id"],
+                "scan_id": row["scan_id"],
+                "mode": row["mode"],
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+                "reported_comment_count": reported_count,
+                "observed_at": observed_at,
+                "timestamp_basis": timestamp_basis,
+                "observation_source": post.get("comment_count_source", "legacy_run_report"),
+                "root_protocol_complete": report.get("root_protocol_complete"),
+            })
+        return history
+
+    def scan_changes(self, media_id: str, scan_id: str, *, complete: bool) -> dict[str, Any]:
+        current_rows = self.connection.execute(
+            """
+            SELECT observation_id, comment_id, data_json FROM comment_observations
+            WHERE media_id = ? AND scan_id = ? ORDER BY observation_id
+            """,
+            (media_id, scan_id),
+        ).fetchall()
+        current: dict[str, dict[str, Any]] = {}
+        for row in current_rows:
+            comment_id = row["comment_id"]
+            current[comment_id] = _merge(
+                current.get(comment_id, {}), json.loads(row["data_json"])
+            )
+
+        first_observation = current_rows[0]["observation_id"] if current_rows else None
+        prior_rows = self.connection.execute(
+            """
+            SELECT comment_id, data_json FROM comment_observations
+            WHERE media_id = ? AND scan_id <> ? AND (? IS NULL OR observation_id < ?)
+            ORDER BY observation_id
+            """,
+            (media_id, scan_id, first_observation, first_observation),
+        ).fetchall()
+        prior: dict[str, dict[str, Any]] = {}
+        for row in prior_rows:
+            comment_id = row["comment_id"]
+            prior[comment_id] = _merge(
+                prior.get(comment_id, {}), json.loads(row["data_json"])
+            )
+
+        new_ids = sorted(current.keys() - prior.keys())
+        updated_fields: dict[str, list[str]] = {}
+        for comment_id in current.keys() & prior.keys():
+            merged = _merge(prior[comment_id], current[comment_id])
+            changed = [
+                field for field in _COMMENT_CHANGE_FIELDS
+                if merged.get(field) != prior[comment_id].get(field)
+            ]
+            if changed:
+                updated_fields[comment_id] = changed
+
+        not_observed_ids: list[str] | None = None
+        if complete:
+            rows = self.connection.execute(
+                """
+                SELECT comment_id FROM comments
+                WHERE media_id = ? AND last_seen_scan_id <> ?
+                ORDER BY comment_id
+                """,
+                (media_id, scan_id),
+            ).fetchall()
+            not_observed_ids = [row["comment_id"] for row in rows]
+
+        return {
+            "previously_observed_count": len(prior),
+            "observed_count": len(current),
+            "new_ids": new_ids,
+            "updated_fields": updated_fields,
+            "not_observed_ids": not_observed_ids,
         }
 
 

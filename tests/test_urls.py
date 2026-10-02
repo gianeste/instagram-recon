@@ -14,6 +14,12 @@ def test_parse_post_and_reel_urls():
     assert reel.canonical_url == "https://www.instagram.com/reel/AbcDE_12345/"
 
 
+def test_parse_username_prefixed_post_url():
+    post = parse_post_url("https://www.instagram.com/nytimes/p/Dd7eoFRE5_t/")
+    assert post.shortcode == "Dd7eoFRE5_t"
+    assert post.canonical_url == "https://www.instagram.com/p/Dd7eoFRE5_t/"
+
+
 @pytest.mark.parametrize(
     "url,error",
     [

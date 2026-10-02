@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from instagram_collector.crawlee_browser import _child_page
 from instagram_collector.response_fixtures import inspect_response, load_response, normalize_mapped_comments
 
 
@@ -30,3 +31,12 @@ def test_captured_child_fixture_has_reviewed_shape_and_fields() -> None:
     assert all(isinstance(row["created_at"], str) and row["created_at"].endswith("Z") for row in rows)
     assert all(isinstance(row["like_count"], int) for row in rows)
     assert all(row["field_status"]["reply_count"] == "returned_null" for row in rows)
+    paged, has_next, cursor = _child_page(payload, "fixture-media", "18630157939026726")
+    assert [row["id"] for row in paged] == [row["id"] for row in rows]
+    assert all(row["parent_id"] == "18630157939026726" for row in paged)
+    assert all(row["source_operation"] == "PolarisPostChildCommentsQuery" for row in paged)
+    assert (has_next, cursor) == (False, None)
+
+    provenance = json.loads((ROOT / "fixtures" / "fixture-provenance.json").read_text(encoding="utf-8"))
+    assert provenance["fixtures/polaris_child_comments_tree.sanitized.json"]["provenance"] == "imported_external"
+    assert provenance["fixtures/polaris_child_comments_tree.sanitized.json"]["pagination_validated"] is False

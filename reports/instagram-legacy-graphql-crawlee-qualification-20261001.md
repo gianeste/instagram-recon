@@ -66,8 +66,12 @@ HTTP errors, or retries.
 - Command documentation: `README.md`.
 - Saved normalized collection and report:
   `data/legacy-graphql-qualification/legacy-graphql/Dd6m2a6Exca/`.
-- `python -m pytest -q`: **68 passed**.
+- `python -m pytest -q`: **68 passed** was recorded for the earlier snapshot.
 - Python compile check and Node syntax check of the in-page fetch script passed.
+
+The 68-test figure is historical and was not reproducible from the Phase 2
+checkout. The current suite and clean-install result are recorded in
+[`instagram-comment-tree-qualification.md`](instagram-comment-tree-qualification.md).
 
 This is an experimental compatibility path for an undocumented historical
 Instagram query, not a supported API. The qualified claim is limited to root
