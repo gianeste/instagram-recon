@@ -104,3 +104,21 @@ verify request construction, response classification, cursor linkage,
 SQLite page commits, deduplication, and preservation of the root checkpoint
 **offline**. The direct transport remains a prototype until separately
 qualified against authorized live access.
+
+## Reply batching, request limits, and exit status
+
+By default, one `collect` invocation processes every eligible pending reply
+parent sequentially in the same Crawlee handler and reuses its browser page and
+selected transport. Completed branches are skipped; an incomplete branch resumes
+from its own committed cursor before later parents are considered. Use
+`--max-http-requests` for a global per-run cap across root and reply GraphQL
+requests. A budget stop is reported as `request_budget` and does not erase the
+last committed parent or root cursor.
+
+The report separates `ROOT_PROTOCOL_COMPLETE` and `REPLIES_PROTOCOL_COMPLETE`
+from `COUNT_CONSISTENT` and `SOURCE_COVERAGE_UNKNOWN`. Cursor exhaustion with a
+count mismatch is not labeled partial traversal; the count mismatch remains
+explicit, and source coverage remains unknown. CLI exit code `2` is retained for
+backward compatibility when traversal is partial, root/reply counts disagree,
+the reported total is inconsistent or unavailable, or count semantics have not
+been validated. Use the report status fields to distinguish those cases.

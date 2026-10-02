@@ -979,7 +979,9 @@ def test_count_reconciliation_and_protocol_completeness_are_separate(tmp_path):
         assert report["reply_branches"][0]["status"] == "COMPLETE"
         assert report["complete_parent_branches"] == 1
         assert report["reported_count_semantics_validated"] is False
-        assert report["collection_partial"] is True
+        assert report["collection_partial"] is False
+        assert report["collection_status"]["COUNT_CONSISTENT"] is True
+        assert report["collection_status"]["SOURCE_COVERAGE_UNKNOWN"] is True
         assert report["qualification_levels"]["REPLY_COLLECTION_QUALIFIED"] is True
         assert report["qualification_levels"]["CHILD_OPERATION_LIVE_QUALIFIED"] is False
         output = tmp_path / SHORTCODE
@@ -1015,6 +1017,270 @@ def test_unattempted_reply_branches_report_partial(tmp_path):
         assert report["reported_count_consistent"] is False
         assert report["unresolved_count_difference"] == 2
         assert report["collection_partial"] is True
+    finally:
+        run.store.close()
+
+
+def test_global_budget_batches_parents_and_resume_skips_completed_and_root_pages(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    config = BrowserExperimentConfig(
+        target_url=f"https://www.instagram.com/p/{SHORTCODE}/",
+        output_root=tmp_path,
+        max_http_requests=2,
+    )
+    run = BrowserCommentExperiment(config)
+    root_ids = [PARENT_ID, "parent-2", "parent-3"]
+    try:
+        run._begin_store(MEDIA_ID)
+        run.store.save_page(
+            media_id=MEDIA_ID, edge="comments", parent_id=None,
+            records=[root_record(parent, 1) for parent in root_ids],
+            run_id=run.run_id, scan_id=run.scan_id, next_cursor=None,
+            has_next=False, current_cursor=None,
+        )
+        root_checkpoint = run.store.checkpoint(MEDIA_ID, "comments")
+        sequence = []
+        active = 0
+        max_active = 0
+
+        async def fixture_page(args):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            parent = args["variables"]["parent_comment_id"]
+            sequence.append(parent)
+            try:
+                return {
+                    "status": 200, "contentType": "application/json", "json": True,
+                    "payload": child_payload(parent_id=parent, ids=(f"reply-{parent}",)),
+                }
+            finally:
+                active -= 1
+
+        asyncio.run(run._collect_replies(FakePage(fixture_page)))
+        first_report = run.report("request_budget")
+        assert sequence == root_ids[:2]
+        assert max_active == 1
+        assert first_report["complete_parent_branches"] == 2
+        assert first_report["unattempted_parent_branches"] == 1
+        assert first_report["reply_stop_reason"] == "request_budget"
+        assert first_report["collection_status"]["TRANSPORT_SUCCESS"] is True
+        assert first_report["collection_status"]["OPERATIONAL_FAILURE"] is False
+        assert run.store.checkpoint(MEDIA_ID, "replies", "parent-3") is None
+        assert run.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        assert len(run.store.all_comments(MEDIA_ID)) == 5
+    finally:
+        run.store.close()
+
+    resumed = BrowserCommentExperiment(replace(config, max_http_requests=1))
+    try:
+        resumed._begin_store(MEDIA_ID)
+
+        async def no_root_recrawl(_args):
+            pytest.fail("completed root cursor must not be requested on reply resume")
+
+        asyncio.run(resumed._collect_legacy_graphql(FakePage(no_root_recrawl)))
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        resumed_sequence = []
+
+        async def last_parent(args):
+            parent = args["variables"]["parent_comment_id"]
+            resumed_sequence.append(parent)
+            return {
+                "status": 200, "contentType": "application/json", "json": True,
+                "payload": child_payload(parent_id=parent, ids=(f"reply-{parent}",)),
+            }
+
+        asyncio.run(resumed._collect_replies(FakePage(last_parent)))
+        final_report = resumed.report("natural_exhaustion")
+        assert resumed_sequence == ["parent-3"]
+        assert final_report["replies_protocol_complete"] is True
+        assert final_report["complete_parent_branches"] == 3
+        assert final_report["duplicate_records"] == 0
+        assert final_report["http_requests_this_run"] == 1
+        assert final_report["reply_parents_attempted_this_run"] == 1
+        assert final_report["collection_status"]["TRANSPORT_SUCCESS"] is True
+        assert len(resumed.store.all_comments(MEDIA_ID)) == 6
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+    finally:
+        resumed.store.close()
+
+
+def test_global_budget_covers_root_and_reply_requests(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    run = BrowserCommentExperiment(BrowserExperimentConfig(
+        target_url=f"https://www.instagram.com/p/{SHORTCODE}/",
+        output_root=tmp_path,
+        max_http_requests=1,
+    ))
+    run._begin_store(MEDIA_ID)
+    try:
+        async def root_page(_args):
+            return {
+                "status": 200, "contentType": "application/json", "json": True,
+                "payload": legacy_payload(PARENT_ID, has_next=False, cursor=None, reply_count=1),
+            }
+
+        asyncio.run(run._collect_legacy_graphql(FakePage(root_page)))
+
+        async def unexpected_reply(_args):
+            pytest.fail("root request consumed the global budget")
+
+        asyncio.run(run._collect_replies(FakePage(unexpected_reply)))
+        report = run.report("request_budget")
+        assert run.http_request_attempts == 1
+        assert run.root_request_attempts_this_run == 1
+        assert run.reply_request_attempts_this_run == 0
+        assert report["root_protocol_complete"] is True
+        assert report["replies_protocol_complete"] is False
+        assert report["reply_stop_reason"] == "request_budget"
+        assert report["collection_status"]["TRANSPORT_SUCCESS"] is True
+        assert report["collection_status"]["OPERATIONAL_FAILURE"] is False
+    finally:
+        run.store.close()
+
+
+def test_global_budget_saves_reply_cursor_and_resume_uses_only_continuation(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    config = BrowserExperimentConfig(
+        target_url=f"https://www.instagram.com/p/{SHORTCODE}/",
+        output_root=tmp_path,
+        max_http_requests=1,
+    )
+    run = BrowserCommentExperiment(config)
+    run._begin_store(MEDIA_ID)
+    save_root(run, root_record(reply_count=2))
+    root_checkpoint = run.store.checkpoint(MEDIA_ID, "comments")
+    try:
+        async def first_page(args):
+            assert args["variables"]["after"] is None
+            return {
+                "status": 200, "contentType": "application/json", "json": True,
+                "payload": child_payload(ids=("reply-1",), has_next=True, cursor="reply-cursor-1"),
+            }
+
+        asyncio.run(run._collect_replies(FakePage(first_page)))
+        checkpoint = run.store.checkpoint(MEDIA_ID, "replies", PARENT_ID)
+        assert checkpoint == {
+            "after_cursor": "reply-cursor-1", "complete": False,
+            "pages": 1, "last_successful_page": 1, "termination_reason": "request_budget",
+        }
+        assert run.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        assert [row["id"] for row in run.store.comments(MEDIA_ID, parent_id=PARENT_ID)] == ["reply-1"]
+    finally:
+        run.store.close()
+
+    resumed = BrowserCommentExperiment(config)
+    resumed._begin_store(MEDIA_ID)
+    try:
+        async def no_root_replay(_args):
+            pytest.fail("reply resume must preserve and skip the completed root checkpoint")
+
+        asyncio.run(resumed._collect_legacy_graphql(FakePage(no_root_replay)))
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        cursors = []
+
+        async def continuation(args):
+            cursors.append(args["variables"]["after"])
+            assert args["operation"] == "PolarisPostCommentsChildrenPaginationtQuery"
+            return {
+                "status": 200, "contentType": "application/json", "json": True,
+                "payload": child_payload(ids=("reply-2",)),
+            }
+
+        asyncio.run(resumed._collect_replies(FakePage(continuation)))
+        assert cursors == ["reply-cursor-1"]
+        assert resumed.store.checkpoint(MEDIA_ID, "replies", PARENT_ID)["complete"] is True
+        assert len(resumed.store.comments(MEDIA_ID, parent_id=PARENT_ID)) == 2
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+    finally:
+        resumed.store.close()
+
+
+def test_interruption_after_empty_terminal_page_keeps_branch_complete(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    run = experiment(tmp_path)
+    next_parent = "parent-2"
+    try:
+        run.store.save_page(
+            media_id=MEDIA_ID, edge="comments", parent_id=None,
+            records=[root_record(PARENT_ID, 1), root_record(next_parent, 1)],
+            run_id=run.run_id, scan_id=run.scan_id, next_cursor=None,
+            has_next=False, current_cursor=None,
+        )
+        root_checkpoint = run.store.checkpoint(MEDIA_ID, "comments")
+
+        async def interrupted_after_empty_terminal(args):
+            parent = args["variables"]["parent_comment_id"]
+            if parent == PARENT_ID:
+                return {
+                    "status": 200, "contentType": "application/json", "json": True,
+                    "payload": child_payload(ids=(), has_next=False),
+                }
+            assert parent == next_parent
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run._collect_replies(FakePage(interrupted_after_empty_terminal)))
+        empty_terminal = run.store.checkpoint(MEDIA_ID, "replies", PARENT_ID)
+        assert empty_terminal["complete"] is True
+        assert empty_terminal["pages"] == 1
+        assert empty_terminal["termination_reason"] == "natural_exhaustion"
+        assert run.store.comments(MEDIA_ID, parent_id=PARENT_ID) == []
+        assert run.store.checkpoint(MEDIA_ID, "replies", next_parent) is None
+        assert run.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+
+        resumed_requests = []
+
+        async def finish_next_parent(args):
+            parent = args["variables"]["parent_comment_id"]
+            resumed_requests.append(parent)
+            assert parent == next_parent
+            return {
+                "status": 200, "contentType": "application/json", "json": True,
+                "payload": child_payload(parent_id=parent, ids=("reply-next",)),
+            }
+
+        asyncio.run(run._collect_replies(FakePage(finish_next_parent)))
+        report = run.report("resumed_after_empty_terminal")
+        assert resumed_requests == [next_parent]
+        assert report["replies_protocol_complete"] is True
+        assert report["complete_parent_branches"] == 2
+        assert report["duplicate_records"] == 0
+        assert run.store.checkpoint(MEDIA_ID, "replies", PARENT_ID) == empty_terminal
+        assert run.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+    finally:
+        run.store.close()
+
+
+def test_cursor_exhaustion_and_count_discrepancy_are_separate_statuses(tmp_path):
+    run = experiment(tmp_path)
+    try:
+        save_root(run, root_record(reply_count=1))
+        save_reply_page(run, [reply_record("reply-1")])
+        run.reported_count_semantics_validated = False
+        run.reported_comment_count = 99
+        report = run.report("natural_exhaustion")
+        status = report["collection_status"]
+        assert status["ROOT_PROTOCOL_COMPLETE"] is True
+        assert status["REPLIES_PROTOCOL_COMPLETE"] is True
+        assert status["COUNT_CONSISTENT"] is False
+        assert status["SOURCE_COVERAGE_UNKNOWN"] is True
+        assert status["COLLECTION_PARTIAL"] is False
+        assert status["OPERATIONAL_FAILURE"] is False
+        assert report["unresolved_count_difference"] == 97
     finally:
         run.store.close()
 

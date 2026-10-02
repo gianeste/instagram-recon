@@ -103,6 +103,8 @@ def test_full_form_fetch_classifies_success_html_and_rate_limit(tmp_path, monkey
     assert successes[0]["json"] is True and successes[0]["status"] == 200
     assert successes[1]["json"] is False and successes[1]["htmlSignals"]["doctype"]
     assert successes[2]["boundary"] == "rate_limited"
+    assert successes[0]["timingsMs"]["session_initialization"] >= 0
+    assert successes[1]["timingsMs"]["session_initialization"] == 0
     assert len(calls) == 3
     transport.close()
 

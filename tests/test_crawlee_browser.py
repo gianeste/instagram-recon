@@ -28,6 +28,7 @@ def test_collection_modes_are_explicit_and_mutually_exclusive():
     url = "https://www.instagram.com/p/post-1/"
     assert parser.parse_args(["collect", url]).run_mode == "resume"
     assert parser.parse_args(["collect", url, "--reply-parent-id", "parent-1"]).reply_parent_id == "parent-1"
+    assert parser.parse_args(["collect", url, "--max-http-requests", "9"]).max_http_requests == 9
     assert parser.parse_args(["collect", url, "--refresh"]).run_mode == "refresh"
     assert parser.parse_args(["collect", url, "--fresh"]).run_mode == "fresh"
     with pytest.raises(SystemExit):
@@ -38,8 +39,29 @@ def test_collection_config_has_no_alternate_mode_or_persistent_profile():
     names = {field.name for field in fields(BrowserExperimentConfig)}
 
     assert names == {
-        "target_url", "output_root", "headless", "max_root_pages", "max_reply_pages", "reply_parent_id", "duration_seconds", "run_mode", "reply_transport", "reply_form_env", "reply_allow_retarget",
+        "target_url", "output_root", "headless", "max_root_pages", "max_reply_pages", "max_http_requests", "reply_parent_id", "duration_seconds", "run_mode", "reply_transport", "reply_form_env", "reply_allow_retarget",
     }
+
+
+def test_cli_exit_code_2_still_marks_count_mismatch_and_partial_runs(tmp_path, monkeypatch, capsys):
+    args = cli._parser().parse_args(["collect", "https://www.instagram.com/p/post-1/", "--output", str(tmp_path)])
+    report = {
+        "collection_partial": False,
+        "reported_count_consistent": False,
+        "reply_reported_counts_consistent": True,
+        "reported_count_semantics_validated": False,
+    }
+    monkeypatch.setattr(browser, "run_browser_experiment", lambda _config: report)
+    assert cli._collect(args) == 2
+    assert '"reported_count_consistent": false' in capsys.readouterr().out
+
+    report.update(
+        collection_partial=False,
+        reported_count_consistent=True,
+        reply_reported_counts_consistent=True,
+        reported_count_semantics_validated=True,
+    )
+    assert cli._collect(args) == 0
 
 
 def test_legacy_graphql_page_normalizes_comment_and_cursor(tmp_path):
@@ -122,9 +144,31 @@ def test_request_handler_timeout_tracks_collection_duration(tmp_path, monkeypatc
         def stop(self, _reason):
             pass
 
+    class FakePool:
+        def __init__(self, **kwargs):
+            captured["pool"] = kwargs
+
+        def pre_launch_hook(self, handler):
+            return handler
+
+        def post_launch_hook(self, handler):
+            return handler
+
+        def pre_page_create_hook(self, handler):
+            return handler
+
+        def post_page_create_hook(self, handler):
+            return handler
+
+        def pre_page_close_hook(self, handler):
+            return handler
+
+        def post_page_close_hook(self, handler):
+            return handler
+
     monkeypatch.setattr(browser, "_legacy_session", lambda: ([], "app-id"))
     monkeypatch.setattr(browser, "PlaywrightBrowserPlugin", lambda **kwargs: captured.setdefault("plugin", kwargs))
-    monkeypatch.setattr(browser, "BrowserPool", lambda **_kwargs: object())
+    monkeypatch.setattr(browser, "BrowserPool", FakePool)
     monkeypatch.setattr(browser, "PlaywrightCrawler", FakeCrawler)
 
     experiment = BrowserCommentExperiment(BrowserExperimentConfig(
@@ -194,10 +238,22 @@ def test_report_includes_latency_pacing_storage_and_crawlee_timings(tmp_path):
 
         assert performance["saved_request_timing_samples"]["root"]["network"]["count"] == 20
         assert performance["saved_request_timing_samples"]["root"]["network"]["p95_ms"] is not None
+        assert performance["http_execution_ms_this_run"] == 215
         assert performance["request_start_interval_ms_this_run"]["median_ms"] == 525
         assert performance["pacing"]["actual_total_ms"] == 1003
         assert performance["sqlite_ms_this_run"]["commit"] == 0.5
         assert performance["crawlee"]["startup_navigation_scheduling_split_available"] is False
+        assert performance["lifecycle_phases_ms"]["session_pool_enabled"] is False
+        assert performance["response_json_decode_ms_this_run"] == 21
         assert performance["report_generation_ms"] >= 0
     finally:
         experiment.store.close()
+
+
+def test_global_http_budget_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="max_http_requests"):
+        BrowserExperimentConfig(
+            target_url="https://www.instagram.com/p/post-1/",
+            output_root=tmp_path,
+            max_http_requests=0,
+        )

@@ -341,6 +341,7 @@ class BrowserExperimentConfig:
     headless: bool = False
     max_root_pages: int = 3
     max_reply_pages: int = 10
+    max_http_requests: int | None = None
     reply_parent_id: str | None = None
     duration_seconds: float = 120.0
     run_mode: str = "resume"
@@ -353,6 +354,8 @@ class BrowserExperimentConfig:
             raise ValueError("max_root_pages must be at least 1")
         if self.max_reply_pages < 1:
             raise ValueError("max_reply_pages must be at least 1")
+        if self.max_http_requests is not None and self.max_http_requests < 1:
+            raise ValueError("max_http_requests must be at least 1")
         if self.reply_parent_id is not None and (
             not isinstance(self.reply_parent_id, str) or not self.reply_parent_id.strip()
         ):
@@ -369,6 +372,7 @@ class BrowserExperimentConfig:
 
 class BrowserCommentExperiment:
     def __init__(self, config: BrowserExperimentConfig) -> None:
+        initialization_started = time.perf_counter()
         self.config = config
         self.full_form_transport: FullFormReplyTransport | None = None
         self.reference = parse_post_url(config.target_url)
@@ -403,6 +407,8 @@ class BrowserCommentExperiment:
         self.reported_comment_count: int | None = None
         self.root_protocol_complete = False
         self.legacy_observations: list[dict[str, Any]] = []
+        self.legacy_observation_offset = 0
+        self.reply_observation_offset = 0
         self.legacy_status_counts: dict[str, int] = {}
         self.legacy_app_id: str | None = None
         self.legacy_cookies: list[dict[str, Any]] = []
@@ -423,11 +429,23 @@ class BrowserCommentExperiment:
         self.last_handler_finished: float | None = None
         self.crawler_run_started: float | None = None
         self.crawler_run_finished: float | None = None
+        self.lifecycle_timings_ms: dict[str, float] = {}
+        self._lifecycle_marks: dict[str, float] = {}
         self.response_records_this_run = 0
         self.unique_records_added_this_run = 0
         self.root_request_attempts_this_run = 0
         self.reply_request_attempts_this_run = 0
         self.export_ms = 0.0
+        self.lifecycle_timings_ms["collector_initialization"] = (time.perf_counter() - initialization_started) * 1000
+
+    def _request_budget_reached(self) -> bool:
+        return (
+            self.config.max_http_requests is not None
+            and self.http_request_attempts >= self.config.max_http_requests
+        )
+
+    def _record_lifecycle_phase(self, name: str, started: float) -> None:
+        self.lifecycle_timings_ms[name] = (time.perf_counter() - started) * 1000
 
     def _begin_store(self, media_id: str) -> None:
         if self.run_started:
@@ -480,6 +498,10 @@ class BrowserCommentExperiment:
                 reply_status_counts = self.previous_report.get("reply_http_response_status_distribution")
                 if isinstance(reply_status_counts, dict):
                     self.reply_status_counts = {str(key): int(value) for key, value in reply_status_counts.items()}
+        self.legacy_observation_offset = max(
+            0, len(self.legacy_observations) - self.root_request_attempts_this_run
+        )
+        self.reply_observation_offset = len(self.reply_observations)
         stored_post = self.store.get_post(media_id=self.media_id)
         if stored_post:
             saved_count = stored_post["post"].get("comment_count")
@@ -624,6 +646,11 @@ class BrowserCommentExperiment:
 
         cursor = checkpoint["after_cursor"] if checkpoint else None
         pages = checkpoint["pages"] if checkpoint else 0
+        if self._request_budget_reached():
+            self.legacy_stop_reason = "request_budget"
+            if self.media_id:
+                self.store.set_termination(self.media_id, edge, self.legacy_stop_reason)
+            return
         if pages >= self.config.max_root_pages:
             self.legacy_stop_reason = "page_budget"
             if self.media_id:
@@ -632,6 +659,11 @@ class BrowserCommentExperiment:
 
         for _ in range(self.config.max_root_pages - pages):
             page_number = pages + 1
+            if self._request_budget_reached():
+                self.legacy_stop_reason = "request_budget"
+                if self.media_id:
+                    self.store.set_termination(self.media_id, edge, self.legacy_stop_reason)
+                break
             try:
                 self.http_request_attempts += 1
                 self.root_request_attempts_this_run += 1
@@ -814,6 +846,10 @@ class BrowserCommentExperiment:
                 self.legacy_stop_reason = saved["termination_reason"]
                 break
             cursor = next_cursor
+            if self._request_budget_reached():
+                self.legacy_stop_reason = "request_budget"
+                self.store.set_termination(media_id, edge, self.legacy_stop_reason)
+                break
             if pages == self.config.max_root_pages:
                 self.legacy_stop_reason = "page_budget"
                 self.store.set_termination(media_id, edge, self.legacy_stop_reason)
@@ -858,9 +894,19 @@ class BrowserCommentExperiment:
             if pages >= self.config.max_reply_pages:
                 self.store.set_termination(media_id, "replies", "page_budget", parent_id)
                 continue
+            if self._request_budget_reached():
+                self.reply_stop_reason = "request_budget"
+                if pages:
+                    self.store.set_termination(media_id, "replies", self.reply_stop_reason, parent_id)
+                break
 
             for _ in range(self.config.max_reply_pages - pages):
                 page_number = pages + 1
+                if self._request_budget_reached():
+                    self.reply_stop_reason = "request_budget"
+                    if pages:
+                        self.store.set_termination(media_id, "replies", self.reply_stop_reason, parent_id)
+                    break
                 if cursor is None:
                     operation = _CHILD_COMMENTS_INITIAL_OPERATION
                     doc_id = _CHILD_COMMENTS_DOC_ID
@@ -1075,7 +1121,14 @@ class BrowserCommentExperiment:
                     break
                 cursor = next_cursor
                 if pages >= self.config.max_reply_pages:
-                    self.store.set_termination(media_id, "replies", "page_budget", parent_id)
+                    reason = "request_budget" if self._request_budget_reached() else "page_budget"
+                    self.store.set_termination(media_id, "replies", reason, parent_id)
+                    if reason == "request_budget":
+                        self.reply_stop_reason = reason
+                    break
+                if self._request_budget_reached():
+                    self.store.set_termination(media_id, "replies", "request_budget", parent_id)
+                    self.reply_stop_reason = "request_budget"
                     break
                 await self._pace()
             if self.reply_stop_reason:
@@ -1250,11 +1303,34 @@ class BrowserCommentExperiment:
             else last_successful_refresh["ended_at"] if last_successful_refresh else None
         )
         count_history = self.store.reported_count_history(self.media_id) if self.media_id else []
-        collection_partial = not (
-            self.root_protocol_complete and replies_complete and reply_counts_consistent
-            and count_consistent is True
-            and self.reported_count_semantics_validated and not self.schema_errors and not self.reply_stop_reason
+        observations = [
+            *self.legacy_observations[self.legacy_observation_offset:],
+            *self.reply_observations[self.reply_observation_offset:],
+        ]
+        current_reply_observations = self.reply_observations[self.reply_observation_offset:]
+        transport_success = (
+            None if self.http_request_attempts == 0 else
+            len(observations) == self.http_request_attempts
+            and all(item.get("status") == 200 and item.get("json") is True for item in observations)
         )
+        failed_run_reasons = {
+            "browser_start_failed", "crawler_error", "experiment_timeout", "browser_request_error",
+            "network_error", "request_timeout", "http_error", "rate_limited",
+            "authentication_required", "authentication_or_challenge", "access_restriction",
+            "access_denied", "unexpected_response", "unexpected_schema", "graphql_error",
+            "parent_mismatch", "unavailable", "invalid_comment_record", "media_identity_changed",
+            "missing_cursor", "repeated_cursor", "cursor_expired",
+        }
+        operational_failure = bool(
+            termination_reason in failed_run_reasons
+            or self.legacy_stop_reason in failed_run_reasons
+            or self.reply_stop_reason in failed_run_reasons
+            or root_termination in failed_run_reasons
+            or any(branch["termination_reason"] in failed_run_reasons for branch in reply_branches)
+            or self.schema_errors
+        )
+        traversal_partial = not (self.root_protocol_complete and replies_complete)
+        collection_partial = traversal_partial or operational_failure
         report = {
             "url": self.reference.canonical_url,
             "canonical_url": _safe_url(self.page_url or self.reference.canonical_url),
@@ -1292,6 +1368,14 @@ class BrowserCommentExperiment:
             "duplicate_records": self.duplicates,
             "total_http_requests": len(self.legacy_observations) + len(self.reply_observations),
             "http_requests_this_run": self.http_request_attempts,
+            "max_http_requests_per_run": self.config.max_http_requests,
+            "request_budget_exhausted": bool(
+                self.legacy_stop_reason == "request_budget" or self.reply_stop_reason == "request_budget"
+            ),
+            "reply_parents_attempted_this_run": len({
+                row.get("parent_comment_id") for row in current_reply_observations
+                if isinstance(row.get("parent_comment_id"), str)
+            }),
             "http_request_count_scope": "Root and child GraphQL fetch attempts; browser navigation and page resources are excluded.",
             "http_response_status_distribution": self.legacy_status_counts,
             "reply_http_response_status_distribution": self.reply_status_counts,
@@ -1343,6 +1427,7 @@ class BrowserCommentExperiment:
             ),
             "replies_protocol_complete": replies_complete,
             "reply_collection_policy": "sequential_child_operation_after_root_completion",
+            "reply_batch_policy": "one_pending_parent_at_a_time_in_root_order; completed_branches_skipped",
             "reply_reported_counts_consistent": reply_counts_consistent,
             "reported_count_consistent": count_consistent,
             "reported_comment_count": self.reported_comment_count,
@@ -1372,6 +1457,19 @@ class BrowserCommentExperiment:
                 if scan_changes is not None else None
             ),
             "reported_count_semantics_validated": self.reported_count_semantics_validated,
+            "collection_status": {
+                "TRANSPORT_SUCCESS": transport_success,
+                "ROOT_PROTOCOL_COMPLETE": self.root_protocol_complete,
+                "REPLIES_PROTOCOL_COMPLETE": replies_complete,
+                "COUNT_CONSISTENT": count_consistent,
+                "SOURCE_COVERAGE_UNKNOWN": True,
+                "COLLECTION_PARTIAL": collection_partial,
+                "TRAVERSAL_PARTIAL": traversal_partial,
+                "OPERATIONAL_FAILURE": operational_failure,
+            },
+            "operational_failure": operational_failure,
+            "traversal_partial": traversal_partial,
+            "run_termination_reason": termination_reason,
             "comment_count_semantics_note": "The arithmetic comparison does not establish whether Instagram's reported count includes replies or uses the same visibility and sorting scope.",
             "reply_parent_filter": self.config.reply_parent_id,
             "reply_transport": self.config.reply_transport,
@@ -1397,6 +1495,26 @@ class BrowserCommentExperiment:
             if self.crawler_run_started is not None and self.crawler_run_finished is not None else None
         )
         handler_ms = sum(self.handler_durations_ms)
+        request_timing_rows = [
+            item.get("request_timing_ms", {}) for item in observations
+            if isinstance(item.get("request_timing_ms"), dict)
+        ]
+        response_json_decode_ms = sum(
+            value for row in request_timing_rows
+            if isinstance((value := row.get("json_decode")), (int, float))
+        )
+        http_execution_ms = sum(
+            value for row in request_timing_rows
+            if isinstance((value := row.get("network")), (int, float))
+        )
+        http_session_initialization_ms = sum(
+            value for row in request_timing_rows
+            if isinstance((value := row.get("session_initialization")), (int, float))
+        )
+        shutdown_after_handler_ms = (
+            (self.crawler_run_finished - self.last_handler_finished) * 1000
+            if self.crawler_run_finished is not None and self.last_handler_finished is not None else None
+        )
         report["performance"] = {
             "scope": "current run unless request timing samples are explicitly saved across resumes",
             "root_requests_this_run": self.root_request_attempts_this_run,
@@ -1408,6 +1526,8 @@ class BrowserCommentExperiment:
                 "root": _request_timing_summary(self.legacy_observations),
                 "reply": _request_timing_summary(self.reply_observations),
             },
+            "http_execution_ms_this_run": round(http_execution_ms, 3),
+            "http_session_initialization_ms_this_run": round(http_session_initialization_ms, 3),
             "request_start_interval_ms_this_run": _timing_summary(self.request_start_intervals_ms),
             "pacing": {
                 "configured_interval_ms": 500,
@@ -1416,7 +1536,16 @@ class BrowserCommentExperiment:
                 "actual_total_ms": round(self.pacing_actual_ms, 3),
             },
             "normalization_ms_this_run": {key: round(value, 3) for key, value in self.normalization_ms.items()},
+            "response_json_decode_ms_this_run": round(response_json_decode_ms, 3),
             "sqlite_ms_this_run": sqlite_summary,
+            "lifecycle_phases_ms": {
+                **{key: round(value, 3) for key, value in self.lifecycle_timings_ms.items()},
+                "shutdown_after_last_handler": round(shutdown_after_handler_ms, 3) if shutdown_after_handler_ms is not None else None,
+                "session_pool_enabled": False,
+                "session_pool_note": "Crawlee SessionPool is disabled; configured cookies are measured separately.",
+                "request_scheduling_scope": "Crawlee run start until the BrowserPool pre-launch hook, minus measured BrowserPool/plugin initialization; API fetches execute inside the page handler and are not Crawlee-scheduled requests.",
+                "shutdown_scope": "Time from the handler finishing until crawler.run returns; includes Crawlee/browser cleanup and other run finalization.",
+            },
             "crawlee": {
                 "lifecycle_ms": round(crawler_lifecycle_ms, 3) if crawler_lifecycle_ms is not None else None,
                 "handler_count": len(self.handler_durations_ms),
@@ -1430,7 +1559,12 @@ class BrowserCommentExperiment:
                     if self.crawler_run_finished is not None and self.last_handler_finished is not None else None
                 ),
                 "lifecycle_residual_ms": round(max(0.0, crawler_lifecycle_ms - handler_ms), 3) if crawler_lifecycle_ms is not None else None,
-                "startup_navigation_scheduling_split_available": False,
+                "startup_navigation_scheduling_split_available": bool(
+                    "request_scheduling" in self.lifecycle_timings_ms
+                    and "browser_controller_initialization" in self.lifecycle_timings_ms
+                    and "navigation" in self.lifecycle_timings_ms
+                ),
+                "lifecycle_residual_interpretation": "Unattributed Crawlee runtime outside the handler; it is not attributed to browser startup.",
             },
             "report_generation_ms": round((time.perf_counter() - report_started) * 1000, 3),
             "export_files_ms_excluding_report_json": None,
@@ -1445,23 +1579,46 @@ class BrowserCommentExperiment:
             self.store.close()
             raise RuntimeError("Install the project dependencies to use Playwright")
         try:
+            session_started = time.perf_counter()
             self.legacy_cookies, self.legacy_app_id = _legacy_session()
+            self._record_lifecycle_phase("session_configuration_load", session_started)
             if self.config.reply_transport == "full-form":
+                transport_started = time.perf_counter()
                 self.full_form_transport = FullFormReplyTransport(
                     self.config.reply_form_env,
                     allow_retarget=self.config.reply_allow_retarget,
                 )
+                self._record_lifecycle_phase("full_form_session_initialization", transport_started)
         except (OSError, ValueError):
             self.store.close()
             raise
         crawler = None
         reason = "crawl_finished"
         try:
+            crawler_init_started = time.perf_counter()
             plugin = PlaywrightBrowserPlugin(
                 browser_launch_options={"headless": self.config.headless},
                 max_open_pages_per_browser=1,
             )
-            pool = BrowserPool(plugins=[plugin])
+
+            experiment = self
+
+            class TimedBrowserPool(BrowserPool):
+                async def __aenter__(pool_self):
+                    started = time.perf_counter()
+                    try:
+                        return await super().__aenter__()
+                    finally:
+                        experiment._record_lifecycle_phase("browser_runtime_initialization", started)
+
+                async def __aexit__(pool_self, exc_type, exc_value, traceback):
+                    started = time.perf_counter()
+                    try:
+                        return await super().__aexit__(exc_type, exc_value, traceback)
+                    finally:
+                        experiment._record_lifecycle_phase("browser_pool_shutdown", started)
+
+            pool = TimedBrowserPool(plugins=[plugin])
             crawler = PlaywrightCrawler(
                 browser_pool=pool,
                 max_requests_per_crawl=1,
@@ -1474,16 +1631,71 @@ class BrowserCommentExperiment:
                 navigation_timeout=timedelta(seconds=min(45.0, self.config.duration_seconds)),
                 request_handler_timeout=timedelta(seconds=self.config.duration_seconds + 15.0),
             )
+            self._record_lifecycle_phase("crawlee_and_pool_initialization", crawler_init_started)
+
+            if callable(getattr(pool, "pre_launch_hook", None)):
+                @pool.pre_launch_hook
+                async def time_browser_launch(_page_id: str, _plugin: Any) -> None:
+                    now = time.perf_counter()
+                    if self.crawler_run_started is not None and "request_scheduling" not in self.lifecycle_timings_ms:
+                        elapsed = (now - self.crawler_run_started) * 1000
+                        browser_pool_init = self.lifecycle_timings_ms.get("browser_runtime_initialization", 0.0)
+                        self.lifecycle_timings_ms["request_scheduling"] = max(0.0, elapsed - browser_pool_init)
+                    self._lifecycle_marks["browser_controller"] = now
+
+            if callable(getattr(pool, "post_launch_hook", None)):
+                @pool.post_launch_hook
+                async def finish_browser_launch(_page_id: str, _browser: Any) -> None:
+                    started = self._lifecycle_marks.pop("browser_controller", None)
+                    if started is not None:
+                        self._record_lifecycle_phase("browser_controller_initialization", started)
+
+            if callable(getattr(pool, "pre_page_create_hook", None)):
+                @pool.pre_page_create_hook
+                async def time_page_initialization(
+                    _page_id: str, _browser: Any, _options: Any, _proxy: Any,
+                ) -> None:
+                    self._lifecycle_marks["browser_page_initialization"] = time.perf_counter()
+
+            if callable(getattr(pool, "post_page_create_hook", None)):
+                @pool.post_page_create_hook
+                async def finish_page_initialization(_page: Any, _browser: Any) -> None:
+                    started = self._lifecycle_marks.pop("browser_page_initialization", None)
+                    if started is not None:
+                        self._record_lifecycle_phase("browser_page_context_initialization", started)
+
+            if callable(getattr(pool, "pre_page_close_hook", None)):
+                @pool.pre_page_close_hook
+                async def time_page_shutdown(_page: Any, _browser: Any) -> None:
+                    self._lifecycle_marks["browser_page_shutdown"] = time.perf_counter()
+
+            if callable(getattr(pool, "post_page_close_hook", None)):
+                @pool.post_page_close_hook
+                async def finish_page_shutdown(_page_id: str, _browser: Any) -> None:
+                    started = self._lifecycle_marks.pop("browser_page_shutdown", None)
+                    if started is not None:
+                        self._record_lifecycle_phase("browser_page_shutdown", started)
 
             @crawler.pre_navigation_hook
             async def add_session_cookies(context: Any) -> None:
+                started = time.perf_counter()
                 await context.page.context.add_cookies(self.legacy_cookies)
+                self._record_lifecycle_phase("session_cookie_application", started)
+                self._lifecycle_marks["navigation"] = time.perf_counter()
+
+            if callable(getattr(crawler, "post_navigation_hook", None)):
+                @crawler.post_navigation_hook
+                async def finish_navigation(_context: Any) -> None:
+                    started = self._lifecycle_marks.pop("navigation", None)
+                    if started is not None:
+                        self._record_lifecycle_phase("navigation", started)
 
             @crawler.router.default_handler
             async def request_handler(context: PlaywrightCrawlingContext) -> None:
                 await self.handle_page(context)
 
             self.crawler_run_started = time.perf_counter()
+            self.lifecycle_timings_ms["session_pool_initialization"] = 0.0
             crawl_task = asyncio.create_task(crawler.run([self.reference.canonical_url]))
             try:
                 await asyncio.wait_for(asyncio.shield(crawl_task), timeout=self.config.duration_seconds)

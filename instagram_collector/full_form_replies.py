@@ -142,8 +142,11 @@ class FullFormReplyTransport:
     def fetch(self, media_id: str, parent_id: str, cursor: str | None, *, referer: str) -> dict[str, Any]:
         import requests  # Optional dependency: imported only for explicitly selected transport.
         prepared = self.prepare(media_id, parent_id, cursor, referer=referer)
+        session_initialization_ms = 0.0
         if self._session is None:
+            session_started = time.perf_counter()
             self._session = requests.Session()
+            session_initialization_ms = (time.perf_counter() - session_started) * 1000
         started = time.perf_counter()
         try:
             response = self._session.post(
@@ -167,6 +170,7 @@ class FullFormReplyTransport:
                                     "headers": round((headers_received - started) * 1000, 3),
                                     "body": round((body_finished - headers_received) * 1000, 3),
                                     "json_decode": 0.0,
+                                    "session_initialization": round(session_initialization_ms, 3),
                                     "network": round((body_finished - started) * 1000, 3),
                                     "total": round((body_finished - started) * 1000, 3),
                                 }}
@@ -202,6 +206,7 @@ class FullFormReplyTransport:
                         "headers": round((headers_received - started) * 1000, 3),
                         "body": round((body_finished - headers_received) * 1000, 3),
                         "json_decode": round((decoded - decode_started) * 1000, 3),
+                        "session_initialization": round(session_initialization_ms, 3),
                         "network": round((body_finished - started) * 1000, 3),
                         "total": round((decoded - started) * 1000, 3),
                     },
@@ -220,6 +225,7 @@ class FullFormReplyTransport:
                     "timingsMs": {
                         "network": round((time.perf_counter() - started) * 1000, 3),
                         "total": round((time.perf_counter() - started) * 1000, 3),
+                        "session_initialization": round(session_initialization_ms, 3),
                     }}
 
     def close(self) -> None:

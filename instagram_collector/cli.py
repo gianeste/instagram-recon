@@ -39,6 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--headless", action="store_true")
     collect.add_argument("--max-root-pages", type=_positive_int, default=3)
     collect.add_argument("--max-reply-pages", type=_positive_int, default=10)
+    collect.add_argument("--max-http-requests", type=_positive_int, help="Global cap across root and reply GraphQL requests")
     collect.add_argument("--reply-parent-id", help="Limit reply collection to one parent comment ID")
     collect.add_argument("--reply-transport", choices=("browser", "full-form"), default="browser")
     collect.add_argument("--reply-form-env", type=Path, help="Local captured-form .env file (not exported)")
@@ -93,6 +94,7 @@ def _collect(args: argparse.Namespace) -> int:
             headless=args.headless,
             max_root_pages=args.max_root_pages,
             max_reply_pages=args.max_reply_pages,
+            max_http_requests=args.max_http_requests,
             reply_parent_id=args.reply_parent_id,
             duration_seconds=args.duration,
             run_mode=args.run_mode,
@@ -102,7 +104,12 @@ def _collect(args: argparse.Namespace) -> int:
         )
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if not report["collection_partial"] else 2
+    return 0 if (
+        not report["collection_partial"]
+        and report["reported_count_consistent"] is True
+        and report["reply_reported_counts_consistent"] is True
+        and report["reported_count_semantics_validated"] is True
+    ) else 2
 
 
 def _probe_reply(args: argparse.Namespace) -> int:
