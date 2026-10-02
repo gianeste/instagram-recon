@@ -68,7 +68,7 @@ def _timing_summary(values: list[float]) -> dict[str, Any]:
 
 def _request_timing_summary(observations: list[dict[str, Any]]) -> dict[str, Any]:
     names = ("network", "headers", "body", "json_decode", "total", "browser_evaluate_ms", "transport_call_ms")
-    return {
+    summary = {
         name: _timing_summary([
             float(observation["request_timing_ms"][name])
             for observation in observations
@@ -77,6 +77,26 @@ def _request_timing_summary(observations: list[dict[str, Any]]) -> dict[str, Any
         ])
         for name in names
     }
+    resource_rows = [
+        observation["resource_timing"] for observation in observations
+        if isinstance(observation.get("resource_timing"), dict)
+    ]
+    resource_names = ("dns_ms", "connect_ms", "tls_ms", "request_wait_ms", "response_transfer_ms")
+    summary["resource_timing"] = {
+        "available_samples": len(resource_rows),
+        "next_hop_protocols": sorted({
+            row["next_hop_protocol"] for row in resource_rows
+            if isinstance(row.get("next_hop_protocol"), str) and row["next_hop_protocol"]
+        }),
+        **{
+            name: _timing_summary([
+                float(row[name]) for row in resource_rows
+                if isinstance(row.get(name), (int, float))
+            ])
+            for name in resource_names
+        },
+    }
+    return summary
 
 
 def _load_env_file(path: Path = Path(".env")) -> None:
@@ -686,6 +706,20 @@ class BrowserCommentExperiment:
                         const headersReceivedAt = performance.now();
                         const body = await response.text();
                         const bodyFinishedAt = performance.now();
+                        const resourceEntry = performance.getEntriesByName(response.url)
+                          .filter(entry => entry.initiatorType === 'fetch' && entry.startTime >= requestStartedAt).at(-1);
+                        const resourceTiming = resourceEntry ? {
+                          dns_ms: Math.max(0, resourceEntry.domainLookupEnd - resourceEntry.domainLookupStart),
+                          connect_ms: Math.max(0, resourceEntry.connectEnd - resourceEntry.connectStart),
+                          tls_ms: resourceEntry.secureConnectionStart > 0
+                            ? Math.max(0, resourceEntry.connectEnd - resourceEntry.secureConnectionStart) : null,
+                          request_wait_ms: Math.max(0, resourceEntry.responseStart - resourceEntry.requestStart),
+                          response_transfer_ms: Math.max(0, resourceEntry.responseEnd - resourceEntry.responseStart),
+                          transfer_size_bytes: resourceEntry.transferSize,
+                          encoded_body_size_bytes: resourceEntry.encodedBodySize,
+                          decoded_body_size_bytes: resourceEntry.decodedBodySize,
+                          next_hop_protocol: resourceEntry.nextHopProtocol || null,
+                        } : null;
                         const observedAt = new Date().toISOString();
                         const contentType = response.headers.get('Content-Type') || 'unknown';
                         const decodeStartedAt = performance.now();
@@ -703,7 +737,7 @@ class BrowserCommentExperiment:
                           : response.status === 403 ? 'access_denied'
                           : null;
                         return {status: response.status, contentType, bytes: new TextEncoder().encode(body).length,
-                          json: payload !== null, payload, boundary, cursorExpired, observedAt,
+                          json: payload !== null, payload, boundary, cursorExpired, observedAt, resourceTiming,
                           timingsMs: {headers: headersReceivedAt - requestStartedAt,
                             body: bodyFinishedAt - headersReceivedAt,
                             json_decode: decodedAt - decodeStartedAt,
@@ -756,6 +790,7 @@ class BrowserCommentExperiment:
                 "json": result.get("json") is True,
                 "observed_at": result.get("observedAt"),
                 "request_timing_ms": request_timing,
+                "resource_timing": result.get("resourceTiming") if isinstance(result.get("resourceTiming"), dict) else None,
             })
             if result.get("boundary") or status != 200:
                 self.legacy_stop_reason = result.get("boundary") or "http_error"
@@ -965,6 +1000,20 @@ class BrowserCommentExperiment:
                             const headersReceivedAt = performance.now();
                             const body = await response.text();
                             const bodyFinishedAt = performance.now();
+                            const resourceEntry = performance.getEntriesByName(response.url)
+                              .filter(entry => entry.initiatorType === 'fetch' && entry.startTime >= requestStartedAt).at(-1);
+                            const resourceTiming = resourceEntry ? {
+                              dns_ms: Math.max(0, resourceEntry.domainLookupEnd - resourceEntry.domainLookupStart),
+                              connect_ms: Math.max(0, resourceEntry.connectEnd - resourceEntry.connectStart),
+                              tls_ms: resourceEntry.secureConnectionStart > 0
+                                ? Math.max(0, resourceEntry.connectEnd - resourceEntry.secureConnectionStart) : null,
+                              request_wait_ms: Math.max(0, resourceEntry.responseStart - resourceEntry.requestStart),
+                              response_transfer_ms: Math.max(0, resourceEntry.responseEnd - resourceEntry.responseStart),
+                              transfer_size_bytes: resourceEntry.transferSize,
+                              encoded_body_size_bytes: resourceEntry.encodedBodySize,
+                              decoded_body_size_bytes: resourceEntry.decodedBodySize,
+                              next_hop_protocol: resourceEntry.nextHopProtocol || null,
+                            } : null;
                             const observedAt = new Date().toISOString();
                             const contentType = response.headers.get('Content-Type') || 'unknown';
                             const decodeStartedAt = performance.now();
@@ -990,7 +1039,7 @@ class BrowserCommentExperiment:
                               : lower.includes('challenge_required') || lower.includes('checkpoint_required') || lower.includes('captcha') || lower.includes('verify its you') ? 'access_restriction'
                               : response.status === 403 ? 'access_denied' : null;
                             return {status: response.status, contentType, bytes: new TextEncoder().encode(body).length,
-                              json: payload !== null, payload, boundary, htmlSignals, observedAt,
+                              json: payload !== null, payload, boundary, htmlSignals, observedAt, resourceTiming,
                               timingsMs: {headers: headersReceivedAt - requestStartedAt,
                                 body: bodyFinishedAt - headersReceivedAt,
                                 json_decode: decodedAt - decodeStartedAt,
@@ -1045,6 +1094,7 @@ class BrowserCommentExperiment:
                     "json": result.get("json") is True,
                     "observed_at": result.get("observedAt"),
                     "request_timing_ms": request_timing,
+                    "resource_timing": result.get("resourceTiming") if isinstance(result.get("resourceTiming"), dict) else None,
                     "response_classification": _classify_child_response(
                         str(result.get("contentType", "unknown")),
                         is_json=result.get("json") is True,

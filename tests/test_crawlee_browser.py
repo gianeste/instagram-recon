@@ -212,7 +212,14 @@ def test_report_includes_latency_pacing_storage_and_crawlee_timings(tmp_path):
     try:
         experiment._begin_store("shortcode:post-1")
         experiment.legacy_observations = [
-            {"request_timing_ms": {"network": value, "headers": value / 2, "body": value / 4, "json_decode": 1, "browser_evaluate_ms": value + 2}}
+            {
+                "request_timing_ms": {"network": value, "headers": value / 2, "body": value / 4, "json_decode": 1, "browser_evaluate_ms": value + 2},
+                "resource_timing": {
+                    "dns_ms": 0.5, "connect_ms": 2.5, "tls_ms": 1.0,
+                    "request_wait_ms": value / 3, "response_transfer_ms": value / 4,
+                    "next_hop_protocol": "h2",
+                },
+            }
             for value in range(1, 21)
         ]
         experiment.reply_observations = [{"request_timing_ms": {"network": 5, "json_decode": 1}}]
@@ -238,6 +245,10 @@ def test_report_includes_latency_pacing_storage_and_crawlee_timings(tmp_path):
 
         assert performance["saved_request_timing_samples"]["root"]["network"]["count"] == 20
         assert performance["saved_request_timing_samples"]["root"]["network"]["p95_ms"] is not None
+        resource = performance["saved_request_timing_samples"]["root"]["resource_timing"]
+        assert resource["available_samples"] == 20
+        assert resource["next_hop_protocols"] == ["h2"]
+        assert resource["connect_ms"]["median_ms"] == 2.5
         assert performance["http_execution_ms_this_run"] == 215
         assert performance["request_start_interval_ms_this_run"]["median_ms"] == 525
         assert performance["pacing"]["actual_total_ms"] == 1003

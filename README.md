@@ -60,6 +60,10 @@ three-page response chain. The collector now offers an **explicit opt-in**
 transport that follows the latter request format. It does not infer or generate
 Meta application tokens and does not conceal access restrictions.
 
+Install its optional HTTP dependency only when using this transport:
+
+    python -m pip install -e ".[full-form]"
+
 To check this transport in isolation, using the **local, private, existing**
 `instagram-graphql-test/.env` with the two linked request templates:
 
