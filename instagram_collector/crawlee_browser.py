@@ -298,6 +298,30 @@ def _classify_child_response(
     return "non_json"
 
 
+def _child_failure_outcome(result: dict[str, Any]) -> str | None:
+    boundary = result.get("boundary")
+    outcomes = {
+        "rate_limited": "rate_limited",
+        "authentication_required": "authentication_required",
+        "access_restriction": "access_restriction",
+        "access_denied": "access_denied",
+        "request_timeout": "network_timeout",
+        "network_error": "network_failure",
+        "oversize_response": "unexpected_response_size",
+    }
+    if boundary in outcomes:
+        return outcomes[boundary]
+    if result.get("status") is None:
+        return "network_failure"
+    if result.get("json") is True and not isinstance(result.get("payload"), dict):
+        return "unexpected_schema"
+    if result.get("json") is not True or not isinstance(result.get("payload"), dict):
+        content_type = str(result.get("contentType", "")).lower()
+        signals = result.get("htmlSignals") if isinstance(result.get("htmlSignals"), dict) else {}
+        return "unexpected_html" if "html" in content_type or signals.get("html_element") else "non_json_response"
+    return None
+
+
 def _safe_browser_error(exc: Exception) -> str:
     message = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
     message = re.sub(r"https?://\S+", "<url>", message)
@@ -405,6 +429,7 @@ class BrowserCommentExperiment:
         self.scan_id = f"scan-{uuid.uuid4().hex}"
         self.media_id: str | None = None
         self.root_edge = "comments"
+        self.reply_checkpoint_edge = "replies"
         self.is_refresh_scan = False
         self.run_started_at: str | None = None
         self.run_started = False
@@ -472,7 +497,7 @@ class BrowserCommentExperiment:
             return
         self.media_id = str(media_id)
         latest_run = self.store.latest_run(self.media_id)
-        self.previous_report = self.store.latest_report(self.media_id)
+        self.previous_report = None
         if self.config.run_mode == "refresh":
             self.root_edge = "comments_refresh"
             self.is_refresh_scan = True
@@ -486,6 +511,16 @@ class BrowserCommentExperiment:
                 self.root_edge = "comments_refresh"
                 self.is_refresh_scan = True
 
+        self.reply_checkpoint_edge = (
+            f"replies_refresh:{self.scan_id}" if self.is_refresh_scan else "replies"
+        )
+        if (
+            self.config.run_mode not in {"fresh", "refresh"}
+            and latest_run
+            and latest_run["scan_id"] == self.scan_id
+        ):
+            self.previous_report = self.store.latest_report(self.media_id, scan_id=self.scan_id)
+
         if self.config.run_mode != "fresh":
             checkpoint = self.store.checkpoint(self.media_id, self.root_edge)
             if checkpoint:
@@ -498,26 +533,25 @@ class BrowserCommentExperiment:
         if self.previous_report:
             reported = self.previous_report.get("reported_comment_count")
             self.reported_comment_count = reported if isinstance(reported, int) else None
-            if not self.is_refresh_scan:
-                observations = self.previous_report.get("legacy_request_observations")
-                if isinstance(observations, list):
-                    self.legacy_observations = observations.copy()
-                status_counts = self.previous_report.get("http_response_status_distribution")
-                if isinstance(status_counts, dict):
-                    self.legacy_status_counts = {str(key): int(value) for key, value in status_counts.items()}
-                self.target_identity_verified = self.previous_report.get("target_identity_verified")
-                self.media_id_source = self.previous_report.get("media_id_source")
-                self.duplicates = int(self.previous_report.get("duplicate_records", 0) or 0)
-                transitions = self.previous_report.get("pagination_transitions")
-                if isinstance(transitions, dict) and isinstance(transitions.get("root"), list):
-                    self.root_pagination = transitions["root"].copy()
-                    self.reply_pagination = transitions.get("replies", []).copy()
-                observations = self.previous_report.get("reply_request_observations")
-                if isinstance(observations, list):
-                    self.reply_observations = observations.copy()
-                reply_status_counts = self.previous_report.get("reply_http_response_status_distribution")
-                if isinstance(reply_status_counts, dict):
-                    self.reply_status_counts = {str(key): int(value) for key, value in reply_status_counts.items()}
+            observations = self.previous_report.get("legacy_request_observations")
+            if isinstance(observations, list):
+                self.legacy_observations = observations.copy()
+            status_counts = self.previous_report.get("http_response_status_distribution")
+            if isinstance(status_counts, dict):
+                self.legacy_status_counts = {str(key): int(value) for key, value in status_counts.items()}
+            self.target_identity_verified = self.previous_report.get("target_identity_verified")
+            self.media_id_source = self.previous_report.get("media_id_source")
+            self.duplicates = int(self.previous_report.get("duplicate_records", 0) or 0)
+            transitions = self.previous_report.get("pagination_transitions")
+            if isinstance(transitions, dict) and isinstance(transitions.get("root"), list):
+                self.root_pagination = transitions["root"].copy()
+                self.reply_pagination = transitions.get("replies", []).copy()
+            observations = self.previous_report.get("reply_request_observations")
+            if isinstance(observations, list):
+                self.reply_observations = observations.copy()
+            reply_status_counts = self.previous_report.get("reply_http_response_status_distribution")
+            if isinstance(reply_status_counts, dict):
+                self.reply_status_counts = {str(key): int(value) for key, value in reply_status_counts.items()}
         self.legacy_observation_offset = max(
             0, len(self.legacy_observations) - self.root_request_attempts_this_run
         )
@@ -906,11 +940,12 @@ class BrowserCommentExperiment:
             reported_count = root.get("reported_reply_count")
             if not isinstance(reported_count, int) or reported_count <= 0:
                 continue
-            checkpoint = self.store.checkpoint(media_id, "replies", parent_id)
+            edge = self.reply_checkpoint_edge
+            checkpoint = self.store.checkpoint(media_id, edge, parent_id)
             if checkpoint and checkpoint["complete"]:
                 continue
             if checkpoint and checkpoint["termination_reason"] == "cursor_expired" and self.config.run_mode == "resume":
-                self.store.reset_checkpoints(media_id, "replies", parent_id)
+                self.store.reset_checkpoints(media_id, edge, parent_id)
                 self.reply_expiration_restarts.append(parent_id)
                 checkpoint = None
                 self.reply_pagination = [
@@ -919,20 +954,15 @@ class BrowserCommentExperiment:
                 self.reply_observations = [
                     row for row in self.reply_observations if row.get("parent_comment_id") != parent_id
                 ]
-            if checkpoint and checkpoint["termination_reason"] in {
-                "missing_cursor", "repeated_cursor", "unexpected_schema",
-                "unavailable", "parent_mismatch",
-            }:
-                continue
             cursor = checkpoint["after_cursor"] if checkpoint else None
             pages = checkpoint["pages"] if checkpoint else 0
             if pages >= self.config.max_reply_pages:
-                self.store.set_termination(media_id, "replies", "page_budget", parent_id)
+                self.store.set_termination(media_id, edge, "page_budget", parent_id)
                 continue
             if self._request_budget_reached():
                 self.reply_stop_reason = "request_budget"
                 if pages:
-                    self.store.set_termination(media_id, "replies", self.reply_stop_reason, parent_id)
+                    self.store.set_termination(media_id, edge, self.reply_stop_reason, parent_id)
                 break
 
             for _ in range(self.config.max_reply_pages - pages):
@@ -940,7 +970,7 @@ class BrowserCommentExperiment:
                 if self._request_budget_reached():
                     self.reply_stop_reason = "request_budget"
                     if pages:
-                        self.store.set_termination(media_id, "replies", self.reply_stop_reason, parent_id)
+                        self.store.set_termination(media_id, edge, self.reply_stop_reason, parent_id)
                     break
                 if cursor is None:
                     operation = _CHILD_COMMENTS_INITIAL_OPERATION
@@ -1034,12 +1064,18 @@ class BrowserCommentExperiment:
                               ? JSON.stringify({errors: payload.errors, error: payload.error, message: payload.message, status: payload.status})
                               : body.slice(0, 4096);
                             const lower = diagnostic.toLowerCase();
+                            const responsePath = (() => { try { return new URL(response.url).pathname.toLowerCase(); } catch (_) { return ''; } })();
+                            const loginPath = responsePath.startsWith('/accounts/login');
+                            const challengePath = ['/challenge/', '/checkpoint/'].some(path => responsePath.includes(path))
+                              || responsePath.endsWith('/challenge') || responsePath.endsWith('/checkpoint');
                             const boundary = response.status === 429 ? 'rate_limited'
-                              : response.status === 401 || lower.includes('login_required') ? 'authentication_required'
-                              : lower.includes('challenge_required') || lower.includes('checkpoint_required') || lower.includes('captcha') || lower.includes('verify its you') ? 'access_restriction'
+                              : response.status === 401 || loginPath || lower.includes('login_required') || htmlSignals.login_marker ? 'authentication_required'
+                              : challengePath || lower.includes('challenge_required') || lower.includes('checkpoint_required') || lower.includes('captcha') || lower.includes('verify its you') || htmlSignals.challenge_marker ? 'access_restriction'
                               : response.status === 403 ? 'access_denied' : null;
                             return {status: response.status, contentType, bytes: new TextEncoder().encode(body).length,
                               json: payload !== null, payload, boundary, htmlSignals, observedAt, resourceTiming,
+                              responsePath, redirected: response.redirected,
+                              responseEvidence: {loginPath, challengePath, loginMarker: htmlSignals.login_marker, challengeMarker: htmlSignals.challenge_marker},
                               timingsMs: {headers: headersReceivedAt - requestStartedAt,
                                 body: bodyFinishedAt - headersReceivedAt,
                                 json_decode: decodedAt - decodeStartedAt,
@@ -1064,8 +1100,13 @@ class BrowserCommentExperiment:
                         )
                         adapter_ms = (time.perf_counter() - request_started) * 1000
                 except Exception as exc:
-                    self.reply_observations.append({"parent_comment_id": parent_id, "page": page_number, "error": _safe_browser_error(exc)})
-                    self.store.set_termination(media_id, "replies", "network_error", parent_id)
+                    self.reply_observations.append({
+                        "parent_comment_id": parent_id, "page": page_number,
+                        "retrieval_outcome": "network_failure", "failure_reason": "transport_exception",
+                        "error": _safe_browser_error(exc),
+                    })
+                    self.store.set_termination(media_id, edge, "network_error", parent_id)
+                    self.reply_stop_reason = "network_failure"
                     break
 
                 request_timing = dict(result.get("timingsMs")) if isinstance(result.get("timingsMs"), dict) else {}
@@ -1090,6 +1131,10 @@ class BrowserCommentExperiment:
                     "authentication_evidence": "configured_cookie_session_supplied; endpoint acceptance not established",
                     "status": status,
                     "content_type": str(result.get("contentType", "unknown")).split(";", 1)[0].lower(),
+                    "response_path": result.get("responsePath"),
+                    "redirected": result.get("redirected"),
+                    "redirect_location_path": result.get("redirectLocationPath"),
+                    "response_evidence": result.get("responseEvidence", {}),
                     "response_bytes": int(result.get("bytes", 0) or 0),
                     "json": result.get("json") is True,
                     "observed_at": result.get("observedAt"),
@@ -1101,27 +1146,35 @@ class BrowserCommentExperiment:
                         html_signals=result.get("htmlSignals") if isinstance(result.get("htmlSignals"), dict) else None,
                     ),
                     "html_signals": result.get("htmlSignals", {}),
+                    "retrieval_outcome": _child_failure_outcome(result) or "graphql_json_pending_schema_validation",
                 })
                 boundary = result.get("boundary")
                 if boundary or status != 200:
+                    outcome = _child_failure_outcome(result) or "http_error"
                     reason = boundary or "http_error"
-                    self.store.set_termination(media_id, "replies", reason, parent_id)
-                    if reason in {"rate_limited", "authentication_required", "access_restriction", "access_denied"}:
-                        self.reply_stop_reason = reason
+                    self.reply_observations[-1]["retrieval_outcome"] = outcome
+                    self.reply_observations[-1]["failure_reason"] = outcome
+                    self.store.set_termination(media_id, edge, reason, parent_id)
+                    self.reply_stop_reason = outcome
                     break
-                if result.get("json") is not True or not isinstance(result.get("payload"), dict):
-                    self.store.set_termination(media_id, "replies", "unexpected_schema", parent_id)
-                    self.reply_observations[-1]["failure_reason"] = "non_json_or_missing_payload"
-                    self.reply_stop_reason = "unexpected_schema"
+                failure_outcome = _child_failure_outcome(result)
+                if failure_outcome:
+                    self.reply_observations[-1]["failure_reason"] = failure_outcome
+                    self.store.set_termination(media_id, edge, failure_outcome, parent_id)
+                    self.reply_stop_reason = failure_outcome
                     break
                 if result.get("cursorExpired"):
-                    self.store.set_termination(media_id, "replies", "cursor_expired", parent_id)
+                    self.reply_observations[-1]["retrieval_outcome"] = "cursor_expired"
+                    self.store.set_termination(media_id, edge, "cursor_expired", parent_id)
                     break
                 if result.get("unavailable"):
-                    self.store.set_termination(media_id, "replies", "unavailable", parent_id)
+                    self.reply_observations[-1]["retrieval_outcome"] = "unavailable"
+                    self.store.set_termination(media_id, edge, "unavailable", parent_id)
                     break
                 if result.get("graphqlError"):
-                    self.store.set_termination(media_id, "replies", "graphql_error", parent_id)
+                    self.reply_observations[-1]["retrieval_outcome"] = "graphql_error"
+                    self.reply_observations[-1]["failure_reason"] = "graphql_error"
+                    self.store.set_termination(media_id, edge, "graphql_error", parent_id)
                     self.reply_stop_reason = "graphql_error"
                     break
 
@@ -1133,8 +1186,18 @@ class BrowserCommentExperiment:
                     normalization_elapsed = (time.perf_counter() - normalization_started) * 1000
                     self.normalization_ms["reply"] += normalization_elapsed
                     self.reply_observations[-1]["normalization_ms"] = round(normalization_elapsed, 3)
+                    self.reply_observations[-1]["retrieval_outcome"] = (
+                        "valid_empty_terminal_response" if not records and not has_next
+                        else "valid_graphql_json"
+                    )
+                    self.reply_observations[-1]["response_schema"] = {
+                        "connection_key": _CHILD_CONNECTION,
+                        "edge_count": len(records),
+                        "has_next_page": has_next,
+                        "end_cursor_present": next_cursor is not None,
+                    }
                     saved = self.store.save_page(
-                        media_id=media_id, edge="replies", parent_id=parent_id, records=records,
+                        media_id=media_id, edge=edge, parent_id=parent_id, records=records,
                         run_id=self.run_id, scan_id=self.scan_id, next_cursor=next_cursor,
                         has_next=has_next, current_cursor=cursor,
                     )
@@ -1142,14 +1205,17 @@ class BrowserCommentExperiment:
                     self.sqlite_timings_ms.append(saved["timings_ms"])
                 except FixtureError as exc:
                     reason = "parent_mismatch" if "parent relationship" in str(exc) else "unexpected_schema"
-                    self.store.set_termination(media_id, "replies", reason, parent_id)
+                    self.reply_observations[-1]["retrieval_outcome"] = reason
+                    self.reply_observations[-1]["failure_reason"] = reason
+                    self.store.set_termination(media_id, edge, reason, parent_id)
                     self.reply_observations[-1]["error"] = reason
-                    if reason == "unexpected_schema":
-                        self.reply_stop_reason = reason
-                        break
+                    self.reply_stop_reason = reason
                     break
                 except ValueError:
-                    self.store.set_termination(media_id, "replies", "invalid_comment_record", parent_id)
+                    self.reply_observations[-1]["retrieval_outcome"] = "invalid_comment_record"
+                    self.reply_observations[-1]["failure_reason"] = "invalid_comment_record"
+                    self.store.set_termination(media_id, edge, "invalid_comment_record", parent_id)
+                    self.reply_stop_reason = "invalid_comment_record"
                     break
 
                 pages = saved["pages"]
@@ -1172,12 +1238,12 @@ class BrowserCommentExperiment:
                 cursor = next_cursor
                 if pages >= self.config.max_reply_pages:
                     reason = "request_budget" if self._request_budget_reached() else "page_budget"
-                    self.store.set_termination(media_id, "replies", reason, parent_id)
+                    self.store.set_termination(media_id, edge, reason, parent_id)
                     if reason == "request_budget":
                         self.reply_stop_reason = reason
                     break
                 if self._request_budget_reached():
-                    self.store.set_termination(media_id, "replies", "request_budget", parent_id)
+                    self.store.set_termination(media_id, edge, "request_budget", parent_id)
                     self.reply_stop_reason = "request_budget"
                     break
                 await self._pace()
@@ -1235,6 +1301,11 @@ class BrowserCommentExperiment:
         reply_by_parent: dict[str, list[dict[str, Any]]] = {}
         for reply in reply_rows:
             reply_by_parent.setdefault(reply["parent_id"], []).append(reply)
+        refresh_observations = (
+            self.store.scan_changes(self.media_id, self.scan_id, complete=False)
+            if self.media_id and self.is_refresh_scan else None
+        )
+        refresh_new_ids = set(refresh_observations["new_ids"]) if refresh_observations else set()
         reply_branches = []
         roots_with_unknown_reply_count = 0
         for root in root_rows:
@@ -1245,9 +1316,16 @@ class BrowserCommentExperiment:
             if reported <= 0:
                 continue
             parent_id = root["id"]
-            checkpoint = self.store.checkpoint(self.media_id, "replies", parent_id) if self.media_id else None
+            checkpoint = (
+                self.store.checkpoint(self.media_id, self.reply_checkpoint_edge, parent_id)
+                if self.media_id else None
+            )
             branch_replies = reply_by_parent.get(parent_id, [])
             unique_count = len({row["id"] for row in branch_replies})
+            current_replies = (
+                self.store.comments(self.media_id, parent_id=parent_id, scan_id=self.scan_id)
+                if self.media_id else []
+            )
             difference = reported - unique_count
             protocol_complete = bool(
                 checkpoint
@@ -1261,8 +1339,17 @@ class BrowserCommentExperiment:
             )
             reply_branches.append({
                 "parent_comment_id": parent_id,
+                "checkpoint_edge": self.reply_checkpoint_edge,
                 "reported_reply_count": reported,
                 "unique_reply_count": unique_count,
+                "current_scan_reply_count": len({row["id"] for row in current_replies}),
+                "new_reply_ids": sorted(
+                    {row["id"] for row in current_replies} & refresh_new_ids
+                ),
+                "completeness_history": (
+                    self.store.reply_checkpoint_history(self.media_id, parent_id)
+                    if self.media_id else []
+                ),
                 "pages_observed": checkpoint["pages"] if checkpoint else 0,
                 "last_successful_page": checkpoint["last_successful_page"] if checkpoint else 0,
                 "termination_reason": checkpoint["termination_reason"] if checkpoint else "not_attempted",
@@ -1330,9 +1417,10 @@ class BrowserCommentExperiment:
             "media_dimensions": post_metadata.get("media_dimensions"),
             "reel_metadata": post_metadata.get("reel_metadata"),
         }
+        refresh_complete = self.root_protocol_complete and replies_complete
         scan_changes = (
             self.store.scan_changes(
-                self.media_id, self.scan_id, complete=self.root_protocol_complete
+                self.media_id, self.scan_id, complete=refresh_complete
             )
             if self.media_id and self.is_refresh_scan else None
         )
@@ -1343,13 +1431,15 @@ class BrowserCommentExperiment:
             self.store.latest_successful_run(self.media_id, mode="refresh")
             if self.media_id else None
         )
-        collection_completed_now = self.root_protocol_complete and self.root_pages_this_run > 0
+        collection_completed_now = (
+            self.root_protocol_complete and replies_complete and self.http_request_attempts > 0
+        )
         last_successful_at = (
             report_collected_at if collection_completed_now
             else last_successful["ended_at"] if last_successful else None
         )
         last_refresh_at = (
-            report_collected_at if self.is_refresh_scan and self.root_protocol_complete and self.root_pages_this_run > 0
+            report_collected_at if self.is_refresh_scan and refresh_complete and self.http_request_attempts > 0
             else last_successful_refresh["ended_at"] if last_successful_refresh else None
         )
         count_history = self.store.reported_count_history(self.media_id) if self.media_id else []
@@ -1368,7 +1458,8 @@ class BrowserCommentExperiment:
             "network_error", "request_timeout", "http_error", "rate_limited",
             "authentication_required", "authentication_or_challenge", "access_restriction",
             "access_denied", "unexpected_response", "unexpected_schema", "graphql_error",
-            "parent_mismatch", "unavailable", "invalid_comment_record", "media_identity_changed",
+            "unexpected_html", "non_json_response", "network_failure", "network_timeout",
+            "unexpected_response_size", "parent_mismatch", "unavailable", "invalid_comment_record", "media_identity_changed",
             "missing_cursor", "repeated_cursor", "cursor_expired",
         }
         operational_failure = bool(
@@ -1398,6 +1489,7 @@ class BrowserCommentExperiment:
             "last_successful_collection_at": last_successful_at,
             "last_refresh_at": last_refresh_at,
             "root_checkpoint_edge": self.root_edge,
+            "reply_checkpoint_edge": self.reply_checkpoint_edge,
             "target_identity_verified": self.target_identity_verified,
             "media_id_source": self.media_id_source,
             "legacy_request_observations": self.legacy_observations,
@@ -1486,7 +1578,7 @@ class BrowserCommentExperiment:
             "unresolved_count_difference": unresolved_difference,
             "refresh_delta": (
                 {
-                    "status": "COMPLETE" if self.root_protocol_complete else "PARTIAL",
+                    "status": "COMPLETE" if refresh_complete else "PARTIAL",
                     "previously_observed_count": scan_changes["previously_observed_count"],
                     "observed_count": scan_changes["observed_count"],
                     "new_comment_ids": scan_changes["new_ids"],
@@ -1500,8 +1592,8 @@ class BrowserCommentExperiment:
                     ),
                     "not_observed_means_deleted": False,
                     "coverage_note": (
-                        "Sequential traversal of the complete saved ranked cursor chain; ordering is not "
-                        "chronological, so a bounded page budget cannot establish complete discovery."
+                        "Roots and every observed reply-bearing parent were traversed to protocol termination; "
+                        "ordering is not chronological, so a bounded page budget cannot establish complete discovery."
                     ),
                 }
                 if scan_changes is not None else None

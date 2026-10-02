@@ -482,16 +482,39 @@ class StateStore:
         ).fetchone()
         return int(row["roots"] or 0), int(row["replies"] or 0)
 
-    def latest_report(self, media_id: str) -> dict[str, Any] | None:
+    def latest_report(self, media_id: str, scan_id: str | None = None) -> dict[str, Any] | None:
         row = self.connection.execute(
             """
             SELECT report_json FROM collection_runs
             WHERE media_id = ? AND report_json IS NOT NULL
+              AND (? IS NULL OR scan_id = ?)
             ORDER BY started_at DESC, rowid DESC LIMIT 1
             """,
-            (media_id,),
+            (media_id, scan_id, scan_id),
         ).fetchone()
         return json.loads(row["report_json"]) if row else None
+
+    def reply_checkpoint_history(self, media_id: str, parent_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT edge, complete, pages, termination_reason, updated_at
+            FROM checkpoints
+            WHERE media_id = ? AND parent_key = ?
+              AND (edge = 'replies' OR edge GLOB 'replies_refresh:*')
+            ORDER BY updated_at, edge
+            """,
+            (media_id, parent_id),
+        ).fetchall()
+        return [
+            {
+                "checkpoint_edge": row["edge"],
+                "complete": bool(row["complete"]),
+                "pages": row["pages"],
+                "termination_reason": row["termination_reason"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
 
     def latest_run(self, media_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -525,7 +548,10 @@ class StateStore:
         )
         for row in rows:
             report = json.loads(row["report_json"])
-            if report.get("root_protocol_complete") is True:
+            if (
+                report.get("root_protocol_complete") is True
+                and (row["mode"] != "refresh" or report.get("replies_protocol_complete") is True)
+            ):
                 return {
                     "run_id": row["run_id"],
                     "scan_id": row["scan_id"],

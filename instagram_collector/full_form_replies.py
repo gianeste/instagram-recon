@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .storage import utc_now
 
@@ -157,6 +158,13 @@ class FullFormReplyTransport:
             with response:
                 status = response.status_code
                 content_type = response.headers.get("Content-Type", "unknown")
+                response_path = urlsplit(getattr(response, "url", ENDPOINT)).path.lower()
+                location = response.headers.get("Location")
+                redirect_location_path = urlsplit(location).path.lower() if location else None
+                redirected = bool(
+                    getattr(response, "is_redirect", False)
+                    or getattr(response, "is_permanent_redirect", False)
+                )
                 length = 0
                 chunks = []
                 # Restrict response memory; never persist raw API bodies or session data.
@@ -166,6 +174,9 @@ class FullFormReplyTransport:
                         body_finished = time.perf_counter()
                         return {"status": status, "contentType": content_type, "bytes": length,
                                 "json": False, "payload": None, "boundary": "oversize_response",
+                                "responsePath": response_path,
+                                "redirected": redirected,
+                                "redirectLocationPath": redirect_location_path,
                                 "timingsMs": {
                                     "headers": round((headers_received - started) * 1000, 3),
                                     "body": round((body_finished - headers_received) * 1000, 3),
@@ -187,20 +198,33 @@ class FullFormReplyTransport:
                     payload = None
                 diagnostic = ""
                 if payload is not None:
-                    diagnostic = str({key: payload.get(key) for key in ("status", "message", "error")}).lower()
+                    diagnostic = str({key: payload.get(key) for key in ("status", "message", "error", "errors")}).lower()
                 else:
                     diagnostic = body[:4096].decode("utf-8", errors="replace").lower()
+                low = body[:16384].decode("utf-8", errors="replace").lower() if payload is None else ""
+                login_marker = "log in to instagram" in low or "login required" in low
+                challenge_marker = any(marker in low for marker in ("challenge_required", "checkpoint_required", "captcha", "verify its you"))
+                login_path = response_path.startswith("/accounts/login") or bool(redirect_location_path and redirect_location_path.startswith("/accounts/login"))
+                challenge_path = any(marker in (response_path, redirect_location_path or "") for marker in ("/challenge/", "/checkpoint/"))
                 boundary = (
                     "rate_limited" if status == 429 else
-                    "authentication_required" if status == 401 or "login_required" in diagnostic else
+                    "authentication_required" if status == 401 or login_path or "login_required" in diagnostic or login_marker else
+                    "access_restriction" if challenge_path or challenge_marker or any(x in diagnostic for x in ("challenge_required", "checkpoint_required", "captcha", "verify its you")) else
                     "access_denied" if status == 403 else
-                    "access_restriction" if any(x in diagnostic for x in ("challenge_required", "checkpoint_required", "captcha")) else
                     None
                 )
-                low = body[:16384].decode("utf-8", errors="replace").lower() if payload is None else ""
                 return {
                     "status": status, "contentType": content_type, "bytes": length,
                     "json": payload is not None, "payload": payload, "boundary": boundary,
+                    "responsePath": response_path,
+                    "redirected": redirected,
+                    "redirectLocationPath": redirect_location_path,
+                    "responseEvidence": {
+                        "loginPath": login_path,
+                        "challengePath": challenge_path,
+                        "loginMarker": login_marker,
+                        "challengeMarker": challenge_marker,
+                    },
                     "observedAt": utc_now(),
                     "timingsMs": {
                         "headers": round((headers_received - started) * 1000, 3),

@@ -79,10 +79,15 @@ def test_full_form_fetch_classifies_success_html_and_rate_limit(tmp_path, monkey
     transport = FullFormReplyTransport(write_config(tmp_path / "private.env"))
     calls = []
     class FakeResponse:
-        def __init__(self, status, mime, data):
+        def __init__(self, status, mime, data, location=None):
             self.status_code = status
             self.headers = {"Content-Type": mime}
+            if location:
+                self.headers["Location"] = location
             self.data = data
+            self.url = "https://www.instagram.com/api/graphql"
+            self.is_redirect = location is not None
+            self.is_permanent_redirect = False
         def __enter__(self): return self
         def __exit__(self, *_): return False
         def iter_content(self, chunk_size): yield self.data
@@ -91,6 +96,8 @@ def test_full_form_fetch_classifies_success_html_and_rate_limit(tmp_path, monkey
             FakeResponse(200, "text/javascript", b'{"data":{"ok":true}}'),
             FakeResponse(200, "text/html", b'<!doctype html><html><title>Instagram</title>'),
             FakeResponse(429, "text/plain", b''),
+            FakeResponse(302, "text/html", b'', "/accounts/login/"),
+            FakeResponse(302, "text/html", b'', "/challenge/"),
         ]
         def post(self, url, *, headers, data, timeout, allow_redirects, stream):
             calls.append((url, data.copy(), headers["x-fb-friendly-name"]))
@@ -99,13 +106,18 @@ def test_full_form_fetch_classifies_success_html_and_rate_limit(tmp_path, monkey
         def close(self): pass
     import requests
     monkeypatch.setattr(requests, "Session", FakeSession)
-    successes = [transport.fetch("media-1", "parent-1", None, referer="https://www.instagram.com/p/a/") for _ in range(3)]
+    successes = [transport.fetch("media-1", "parent-1", None, referer="https://www.instagram.com/p/a/") for _ in range(5)]
     assert successes[0]["json"] is True and successes[0]["status"] == 200
     assert successes[1]["json"] is False and successes[1]["htmlSignals"]["doctype"]
     assert successes[2]["boundary"] == "rate_limited"
+    assert successes[1]["boundary"] is None
+    assert successes[3]["boundary"] == "authentication_required"
+    assert successes[3]["responseEvidence"]["loginPath"] is True
+    assert successes[4]["boundary"] == "access_restriction"
+    assert successes[4]["responseEvidence"]["challengePath"] is True
     assert successes[0]["timingsMs"]["session_initialization"] >= 0
     assert successes[1]["timingsMs"]["session_initialization"] == 0
-    assert len(calls) == 3
+    assert len(calls) == 5
     transport.close()
 
 

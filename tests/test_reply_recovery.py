@@ -67,6 +67,27 @@ def reply_record(comment_id, parent_id=PARENT_ID):
     }, MEDIA_ID, None, source="fixture-reply")
 
 
+def observed_root_record(comment_id, reply_count):
+    return normalize_comment({
+        "id": comment_id,
+        "from": {"id": "author-1", "username": "rooter"},
+        "text": f"root {comment_id}",
+        "timestamp": 1730000000,
+        "reply_count": reply_count,
+    }, MEDIA_ID, None, source="fixture-root")
+
+
+def fetched_reply_record(comment_id, parent_id):
+    return normalize_comment({
+        "id": comment_id,
+        "parent_id": parent_id,
+        "from": {"id": "author-2", "username": "replier"},
+        "text": "reply text",
+        "timestamp": 1730000001,
+        "like_count": 2,
+    }, MEDIA_ID, None, source="fixture-reply")
+
+
 def child_payload(parent_id=PARENT_ID, ids=("reply-1",), *, has_next=False, cursor=None):
     return {"data": {_CHILD_CONNECTION: {
         "edges": [{"node": {
@@ -99,6 +120,61 @@ def legacy_payload(comment_id, *, has_next, cursor, reply_count=0):
     }}}
 
 
+def legacy_roots_payload(roots, *, reported_count, has_next=False, cursor=None):
+    edges = []
+    for comment_id, reply_count, embedded_ids in roots:
+        edges.append({"node": {
+            "id": comment_id,
+            "owner": {"id": "author-1", "username": "rooter"},
+            "text": f"root {comment_id}",
+            "created_at": 1730000000,
+            "edge_threaded_comments": {
+                "count": reply_count,
+                "edges": [{"node": {
+                    "id": reply_id,
+                    "owner": {"id": "author-2", "username": "replier"},
+                    "text": f"reply {reply_id}",
+                    "created_at": 1730000001,
+                }} for reply_id in embedded_ids],
+            },
+        }})
+    return {"data": {"shortcode_media": {
+        "shortcode": SHORTCODE,
+        "edge_media_to_parent_comment": {
+            "count": reported_count,
+            "edges": edges,
+            "page_info": {"has_next_page": has_next, "end_cursor": cursor},
+        },
+    }}}
+
+
+def seed_refresh_baseline(tmp_path, parent_ids=(PARENT_ID, "parent-2")):
+    baseline = experiment(tmp_path, mode="fresh")
+    try:
+        roots = [observed_root_record(parent_id, 1) for parent_id in parent_ids]
+        baseline.store.save_page(
+            media_id=MEDIA_ID, edge="comments", parent_id=None, records=roots,
+            run_id=baseline.run_id, scan_id=baseline.scan_id, next_cursor=None,
+            has_next=False, current_cursor=None,
+        )
+        for parent_id in parent_ids:
+            baseline.store.save_page(
+                media_id=MEDIA_ID, edge="replies", parent_id=parent_id,
+                records=[fetched_reply_record(f"old-{parent_id}", parent_id)],
+                run_id=baseline.run_id, scan_id=baseline.scan_id, next_cursor=None,
+                has_next=False, current_cursor=None,
+            )
+        baseline.reported_comment_count = len(parent_ids) * 2
+        baseline._save_response_metadata()
+        baseline.store.finish_run(baseline.run_id, {
+            "root_protocol_complete": True,
+            "replies_protocol_complete": True,
+            "reported_comment_count": baseline.reported_comment_count,
+        })
+    finally:
+        baseline.store.close()
+
+
 def save_root(experiment, record=None):
     experiment.store.save_page(
         media_id=MEDIA_ID,
@@ -116,7 +192,7 @@ def save_root(experiment, record=None):
 def save_reply_page(experiment, records, *, has_next=False, cursor=None, current=None):
     return experiment.store.save_page(
         media_id=MEDIA_ID,
-        edge="replies",
+        edge=experiment.reply_checkpoint_edge,
         parent_id=PARENT_ID,
         records=records,
         run_id=experiment.run_id,
@@ -281,6 +357,7 @@ def test_two_populated_reply_pages_then_empty_terminal_complete_branch(tmp_path,
             "reply-1", "reply-2",
         ]
         assert run.report("empty_terminal_page")["replies_protocol_complete"] is True
+        assert run.reply_observations[-1]["retrieval_outcome"] == "valid_empty_terminal_response"
         assert run.http_request_attempts == 3
         source_by_id = {
             row["id"]: row["source_operation"]
@@ -578,6 +655,7 @@ def test_rate_limit_stops_before_trying_another_reply_parent(tmp_path):
         asyncio.run(run._collect_replies(FakePage(limited)))
         assert len(calls) == 1
         assert run.reply_stop_reason == "rate_limited"
+        assert run.reply_observations[-1]["retrieval_outcome"] == "rate_limited"
         assert run.store.checkpoint(MEDIA_ID, "replies", PARENT_ID)["termination_reason"] == "rate_limited"
         assert run.store.checkpoint(MEDIA_ID, "replies", "parent-2") is None
         assert run.store.checkpoint(MEDIA_ID, "comments")["complete"] is True
@@ -871,6 +949,289 @@ def test_interrupted_refresh_resumes_its_cursor_and_preserves_root_checkpoint(tm
         assert resumed.store.checkpoint(MEDIA_ID, "comments_refresh")["complete"] is True
         assert resumed.store.checkpoint(MEDIA_ID, "comments")["complete"] is True
         assert len(resumed.store.comments(MEDIA_ID, parent_id=None)) == 3
+    finally:
+        resumed.store.close()
+
+
+def test_refresh_rewalks_all_parents_and_deduplicates_embedded_reply_previews(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    seed_refresh_baseline(tmp_path)
+    refreshed = experiment(tmp_path, mode="refresh")
+    root_checkpoint = refreshed.store.checkpoint(MEDIA_ID, "comments")
+    try:
+        async def root_page(args):
+            assert args["after"] is None
+            return {"status": 200, "json": True, "payload": legacy_roots_payload(
+                [
+                    (PARENT_ID, 3, ("new-r1",)),
+                    ("parent-2", 1, ()),
+                    ("parent-3", 1, ()),
+                ],
+                reported_count=9,
+            )}
+
+        asyncio.run(refreshed._collect_legacy_graphql(FakePage(root_page)))
+        requested = []
+
+        async def child_page(args):
+            variables = args["variables"]
+            parent, after = variables["parent_comment_id"], variables["after"]
+            requested.append((parent, after, args["operation"], args["docId"]))
+            if parent == PARENT_ID and after is None:
+                payload = child_payload(parent, ("new-r1", "new-r2"), has_next=True, cursor="p1-next")
+            elif parent == PARENT_ID and after == "p1-next":
+                payload = child_payload(parent, ("new-r3",))
+            elif parent == "parent-2":
+                payload = child_payload(parent, (), has_next=False)
+            elif parent == "parent-3":
+                payload = child_payload(parent, ("new-r4",))
+            else:
+                pytest.fail(f"unexpected refresh request {parent=} {after=}")
+            return {"status": 200, "json": True, "payload": payload}
+
+        asyncio.run(refreshed._collect_replies(FakePage(child_page)))
+        report = refreshed.report("natural_exhaustion")
+        refreshed.store.finish_run(refreshed.run_id, report)
+        assert refreshed.store.latest_successful_run(MEDIA_ID, mode="refresh") is not None
+
+        assert [request[:2] for request in requested] == [
+            (PARENT_ID, None), (PARENT_ID, "p1-next"), ("parent-2", None), ("parent-3", None),
+        ]
+        assert requested[0][2:] == ("PolarisPostChildCommentsQuery", "28027289793632076")
+        assert requested[1][2:] == ("PolarisPostCommentsChildrenPaginationtQuery", "27229753410037873")
+        assert refreshed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        assert refreshed.store.checkpoint(MEDIA_ID, "comments_refresh")["complete"] is True
+        assert refreshed.reply_checkpoint_edge == f"replies_refresh:{refreshed.scan_id}"
+        assert refreshed.store.checkpoint(MEDIA_ID, refreshed.reply_checkpoint_edge, "parent-2") == {
+            "after_cursor": None, "complete": True, "pages": 1,
+            "last_successful_page": 1, "termination_reason": "natural_exhaustion",
+        }
+        records = refreshed.store.all_comments(MEDIA_ID)
+        by_id = {record["id"]: record for record in records}
+        assert len(records) == 9
+        assert by_id["new-r1"]["parent_id"] == PARENT_ID
+        assert by_id["new-r4"]["parent_id"] == "parent-3"
+        assert all(record["media_id"] == MEDIA_ID for record in records)
+        assert report["duplicate_records"] == 3
+        assert report["unique_roots"] == 3
+        assert report["unique_replies"] == 6
+        assert report["replies_protocol_complete"] is True
+        assert report["reported_count_consistent"] is True
+        assert report["last_refresh_at"] is not None
+        assert report["reported_count_history"][-2]["reported_comment_count"] == 4
+        assert report["reported_count_history"][-1]["reported_comment_count"] == 9
+        assert report["refresh_delta"]["status"] == "COMPLETE"
+        assert set(report["refresh_delta"]["new_comment_ids"]) == {
+            "parent-3", "new-r1", "new-r2", "new-r3", "new-r4",
+        }
+        assert report["refresh_delta"]["not_observed_once_ids"] == ["old-parent-1", "old-parent-2"]
+        assert set(next(row for row in report["reply_branches"] if row["parent_comment_id"] == PARENT_ID)["new_reply_ids"]) == {
+            "new-r1", "new-r2", "new-r3",
+        }
+        assert [row["checkpoint_edge"] for row in next(
+            row for row in report["reply_branches"] if row["parent_comment_id"] == PARENT_ID
+        )["completeness_history"]] == ["replies", refreshed.reply_checkpoint_edge]
+    finally:
+        refreshed.store.close()
+
+
+def test_unchanged_refresh_reports_no_new_or_updated_ids(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    seed_refresh_baseline(tmp_path, parent_ids=(PARENT_ID,))
+    refreshed = experiment(tmp_path, mode="refresh")
+    try:
+        async def root_page(_args):
+            return {"status": 200, "json": True, "payload": legacy_roots_payload(
+                [(PARENT_ID, 1, ())], reported_count=2,
+            )}
+
+        asyncio.run(refreshed._collect_legacy_graphql(FakePage(root_page)))
+
+        async def child_page(args):
+            assert args["variables"]["after"] is None
+            return {"status": 200, "json": True, "payload": child_payload(
+                PARENT_ID, (f"old-{PARENT_ID}",),
+            )}
+
+        asyncio.run(refreshed._collect_replies(FakePage(child_page)))
+        report = refreshed.report("natural_exhaustion")
+        assert report["refresh_delta"]["status"] == "COMPLETE"
+        assert report["refresh_delta"]["new_comment_ids"] == []
+        assert report["refresh_delta"]["updated_records"] == {}
+        assert report["unique_comment_ids"] == 2
+        assert report["duplicate_records"] == 2
+        assert report["collection_status"]["REPLIES_PROTOCOL_COMPLETE"] is True
+    finally:
+        refreshed.store.close()
+
+
+def test_interrupted_refresh_resumes_child_cursor_skips_completed_parent_and_root(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    seed_refresh_baseline(tmp_path, parent_ids=("parent-1", "parent-2", "parent-3"))
+    interrupted = experiment(tmp_path, mode="refresh")
+    try:
+        async def root_page(_args):
+            return {"status": 200, "json": True, "payload": legacy_roots_payload(
+                [("parent-1", 1, ()), ("parent-2", 2, ()), ("parent-3", 1, ())],
+                reported_count=7,
+            )}
+
+        asyncio.run(interrupted._collect_legacy_graphql(FakePage(root_page)))
+        active_edge = interrupted.reply_checkpoint_edge
+        root_checkpoint = interrupted.store.checkpoint(MEDIA_ID, "comments")
+        completed_parent_checkpoint = None
+
+        async def fail_after_committed_page(args):
+            parent = args["variables"]["parent_comment_id"]
+            after = args["variables"]["after"]
+            if parent == "parent-1":
+                return {"status": 200, "json": True, "payload": child_payload(parent, ("new-p1",))}
+            if after is None:
+                return {"status": 200, "json": True, "payload": child_payload(
+                    parent, ("new-p2-first",), has_next=True, cursor="p2-cursor",
+                )}
+            raise RuntimeError("injected interruption after committed page")
+
+        asyncio.run(interrupted._collect_replies(FakePage(fail_after_committed_page)))
+        completed_parent_checkpoint = interrupted.store.checkpoint(MEDIA_ID, active_edge, "parent-1")
+        partial = interrupted.report("injected_interruption")
+        interrupted.store.finish_run(interrupted.run_id, partial)
+        assert interrupted.store.latest_successful_run(MEDIA_ID, mode="refresh") is None
+        cursor_checkpoint = interrupted.store.checkpoint(MEDIA_ID, active_edge, "parent-2")
+        assert partial["root_protocol_complete"] is True
+        assert partial["replies_protocol_complete"] is False
+        assert partial["refresh_delta"]["status"] == "PARTIAL"
+        assert partial["last_refresh_at"] is None
+        assert cursor_checkpoint["after_cursor"] == "p2-cursor"
+        assert cursor_checkpoint["pages"] == 1
+        assert cursor_checkpoint["complete"] is False
+    finally:
+        interrupted.store.close()
+
+    resumed = experiment(tmp_path, mode="resume")
+    try:
+        assert resumed.scan_id == interrupted.scan_id
+        assert resumed.reply_checkpoint_edge == active_edge
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        assert resumed.store.checkpoint(MEDIA_ID, active_edge, "parent-1") == completed_parent_checkpoint
+
+        async def no_root_recrawl(_args):
+            pytest.fail("refresh resume must not recrawl its completed root branch")
+
+        asyncio.run(resumed._collect_legacy_graphql(FakePage(no_root_recrawl)))
+        before_duplicates = resumed.duplicates
+        seen = []
+
+        async def finish_remaining(args):
+            parent, after = args["variables"]["parent_comment_id"], args["variables"]["after"]
+            seen.append((parent, after, args["operation"]))
+            if parent == "parent-2" and after == "p2-cursor":
+                return {"status": 200, "json": True, "payload": child_payload(parent, ("new-p2-last",))}
+            if parent == "parent-3" and after is None:
+                return {"status": 200, "json": True, "payload": child_payload(parent, ("new-p3",))}
+            pytest.fail(f"unexpected resume request {parent=} {after=}")
+
+        asyncio.run(resumed._collect_replies(FakePage(finish_remaining)))
+        report = resumed.report("natural_exhaustion")
+        resumed.store.finish_run(resumed.run_id, report)
+        assert resumed.store.latest_successful_run(MEDIA_ID, mode="refresh") is not None
+        assert seen == [
+            ("parent-2", "p2-cursor", "PolarisPostCommentsChildrenPaginationtQuery"),
+            ("parent-3", None, "PolarisPostChildCommentsQuery"),
+        ]
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        assert resumed.store.checkpoint(MEDIA_ID, active_edge, "parent-1") == completed_parent_checkpoint
+        assert resumed.store.checkpoint(MEDIA_ID, active_edge, "parent-2")["complete"] is True
+        assert resumed.store.checkpoint(MEDIA_ID, active_edge, "parent-3")["complete"] is True
+        assert resumed.duplicates == before_duplicates
+        assert report["replies_protocol_complete"] is True
+        assert report["collection_status"]["COLLECTION_PARTIAL"] is False
+        assert report["last_refresh_at"] is not None
+        assert len(resumed.store.all_comments(MEDIA_ID)) == 10
+        assert len({row["id"] for row in resumed.store.all_comments(MEDIA_ID)}) == 10
+        assert resumed.store.checkpoint(MEDIA_ID, "replies", "parent-1")["complete"] is True
+        assert len(report["reported_count_history"]) == 2
+    finally:
+        resumed.store.close()
+
+
+def test_unexpected_html_refresh_is_not_terminal_and_can_resume(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+    monkeypatch.setattr(browser.asyncio, "sleep", no_sleep)
+    seed_refresh_baseline(tmp_path, parent_ids=(PARENT_ID,))
+    interrupted = experiment(tmp_path, mode="refresh")
+    try:
+        async def root_page(_args):
+            return {"status": 200, "json": True, "payload": legacy_roots_payload(
+                [(PARENT_ID, 1, ())], reported_count=2,
+            )}
+
+        asyncio.run(interrupted._collect_legacy_graphql(FakePage(root_page)))
+        root_checkpoint = interrupted.store.checkpoint(MEDIA_ID, "comments")
+        html_signals = {
+            "doctype": True, "html_element": True, "instagram_title": False,
+            "app_assets": True, "splash_screen": False,
+            "login_marker": False, "challenge_marker": False,
+        }
+
+        async def html_response(_args):
+            return {"status": 200, "json": False, "payload": None,
+                    "contentType": "text/html", "bytes": 16384,
+                    "htmlSignals": html_signals, "boundary": None,
+                    "responsePath": "/api/graphql", "redirected": False}
+
+        asyncio.run(interrupted._collect_replies(FakePage(html_response)))
+        edge = interrupted.reply_checkpoint_edge
+        checkpoint = interrupted.store.checkpoint(MEDIA_ID, edge, PARENT_ID)
+        report = interrupted.report("unexpected_html")
+        interrupted.store.finish_run(interrupted.run_id, report)
+        assert checkpoint["complete"] is False
+        assert checkpoint["termination_reason"] == "unexpected_html"
+        assert checkpoint["pages"] == 0
+        assert report["reply_request_observations"][-1]["retrieval_outcome"] == "unexpected_html"
+        assert report["reply_request_observations"][-1]["response_evidence"] == {}
+        assert report["collection_status"]["COLLECTION_PARTIAL"] is True
+        assert report["collection_status"]["OPERATIONAL_FAILURE"] is True
+        assert report["collection_status"]["REPLIES_PROTOCOL_COMPLETE"] is False
+    finally:
+        interrupted.store.close()
+
+    resumed = experiment(tmp_path, mode="resume")
+    try:
+        assert resumed.reply_checkpoint_edge == edge
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+
+        async def no_root_recrawl(_args):
+            pytest.fail("HTML child recovery must not restart completed root collection")
+
+        asyncio.run(resumed._collect_legacy_graphql(FakePage(no_root_recrawl)))
+        seen = []
+
+        async def valid_reply(args):
+            seen.append((args["variables"]["after"], args["operation"]))
+            return {"status": 200, "json": True, "payload": child_payload(
+                PARENT_ID, ("recovered-reply",),
+            )}
+
+        asyncio.run(resumed._collect_replies(FakePage(valid_reply)))
+        report = resumed.report("natural_exhaustion")
+        assert seen == [(None, "PolarisPostChildCommentsQuery")]
+        assert resumed.store.checkpoint(MEDIA_ID, edge, PARENT_ID)["complete"] is True
+        assert resumed.store.checkpoint(MEDIA_ID, "comments") == root_checkpoint
+        assert [row["id"] for row in resumed.store.comments(MEDIA_ID, PARENT_ID)] == [
+            f"old-{PARENT_ID}", "recovered-reply",
+        ]
+        assert [row["retrieval_outcome"] for row in report["reply_request_observations"][-2:]] == [
+            "unexpected_html", "valid_graphql_json",
+        ]
+        assert report["replies_protocol_complete"] is True
     finally:
         resumed.store.close()
 
@@ -1346,8 +1707,9 @@ def test_unexpected_child_response_stops_remaining_branches(tmp_path):
 
         asyncio.run(run._collect_replies(FakePage(non_json)))
         assert len(requests) == 1
-        assert run.reply_stop_reason == "unexpected_schema"
-        assert run.store.checkpoint(MEDIA_ID, "replies", PARENT_ID)["termination_reason"] == "unexpected_schema"
+        assert run.reply_stop_reason == "unexpected_html"
+        assert run.store.checkpoint(MEDIA_ID, "replies", PARENT_ID)["termination_reason"] == "unexpected_html"
+        assert run.reply_observations[-1]["retrieval_outcome"] == "unexpected_html"
         assert run.store.checkpoint(MEDIA_ID, "replies", "parent-2") is None
     finally:
         run.store.close()
@@ -1368,6 +1730,27 @@ def test_child_response_classification_uses_safe_document_signals():
     assert _classify_child_response("text/html", is_json=False, html_signals={"html_element": True}) == "html_document"
     assert _classify_child_response("text/html", is_json=False, html_signals={"login_marker": True}) == "authentication_or_access_document"
     assert _classify_child_response("application/json", is_json=True) == "json"
+
+
+def test_child_retrieval_outcomes_keep_html_auth_and_schema_distinct():
+    from instagram_collector.crawlee_browser import _child_failure_outcome
+
+    assert _child_failure_outcome({
+        "status": 200, "json": False, "payload": None, "contentType": "text/html",
+        "htmlSignals": {"html_element": True, "login_marker": False, "challenge_marker": False},
+    }) == "unexpected_html"
+    assert _child_failure_outcome({
+        "status": 401, "json": False, "payload": None, "boundary": "authentication_required",
+    }) == "authentication_required"
+    assert _child_failure_outcome({
+        "status": 200, "json": False, "payload": None, "boundary": "access_restriction",
+    }) == "access_restriction"
+    assert _child_failure_outcome({
+        "status": 200, "json": True, "payload": [], "contentType": "application/json",
+    }) == "unexpected_schema"
+    assert _child_failure_outcome({
+        "status": None, "json": False, "payload": None, "boundary": "network_error",
+    }) == "network_failure"
 
 
 def test_reply_parent_filter_makes_one_branch_experiment_bounded(tmp_path):
