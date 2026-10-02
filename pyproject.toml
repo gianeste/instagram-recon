@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instagram-post-collector"
+version = "0.1.0"
+description = "Instagram comments collector using Crawlee, CloakBrowser, and legacy GraphQL"
+requires-python = ">=3.12"
+dependencies = ["crawlee[playwright]>=1.9,<2", "cloakbrowser>=0.5,<1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["instagram_collector*"]

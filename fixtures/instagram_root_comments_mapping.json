@@ -1,0 +1,39 @@
+{
+  "operation": "GET /api/v1/media/{media_id}/comments/",
+  "verified": true,
+  "response_shape_fingerprint": "f6e1a57392046cc095183f2b2f956dede47b80d39d1fe482a326b312d3346f16",
+  "items_path": "$.comments[*]",
+  "fields": {
+    "id": "pk",
+    "author_id": "user.pk",
+    "author_username": "user.username",
+    "text": "text",
+    "timestamp": "created_at",
+    "like_count": "comment_like_count",
+    "reply_count": "child_comment_count"
+  },
+  "pagination": {
+    "has_more_comments": "has_more_comments",
+    "has_more_headload_comments": "has_more_headload_comments",
+    "next_cursor": "next_min_id"
+  },
+  "pagination_candidates": {
+    "comments": {
+      "has_more": "has_more_comments",
+      "cursor": "next_max_id",
+      "observed_in_fixture": false
+    },
+    "headload": {
+      "has_more": "has_more_headload_comments",
+      "cursor": "next_min_id",
+      "observed_in_fixture": true
+    }
+  },
+  "qualification": {
+    "request_observed": true,
+    "response_observed": true,
+    "schema_validated": true,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  }
+}

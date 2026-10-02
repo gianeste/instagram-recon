@@ -1,0 +1,151 @@
+{
+  "session_config": {
+    "available": true,
+    "source_keys": [
+      "IG_SESSION_COOKIE",
+      "IG_CSRF_TOKEN"
+    ],
+    "cookie_names": [
+      "csrftoken",
+      "datr",
+      "dpr",
+      "ds_user_id",
+      "ig_did",
+      "mid",
+      "ps_l",
+      "ps_n",
+      "rur",
+      "sessionid",
+      "wd"
+    ],
+    "csrf_matches_cookie": true,
+    "observed_user_agent_available": true,
+    "observed_user_agent_matches_upstream": false,
+    "app_id_matches_upstream": true
+  },
+  "results": [
+    {
+      "schema_version": 1,
+      "project": "instacomments",
+      "mode": "offline_fixture",
+      "target_url": "https://www.instagram.com/p/Dd9MKlfTDho/",
+      "request": {
+        "method": "GET",
+        "endpoint": "https://www.instagram.com/graphql/query/",
+        "query_hash": "97b41c52301f77ce508f55e66d17620e",
+        "variables": {
+          "shortcode": "Dd9MKlfTDho",
+          "first": 50
+        },
+        "attempts": 1
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "bytes": 499,
+        "json_parse_success": true,
+        "top_level_keys": [
+          "data"
+        ],
+        "shortcode_media_present": true,
+        "parent_comment_edge_present": true,
+        "comment_edges_present": true,
+        "comment_edge_count": 1,
+        "page_info_present": true,
+        "has_next_page": false,
+        "end_cursor_present": false,
+        "restriction": "none",
+        "error_message": null
+      },
+      "records_preview": [
+        {
+          "id": "offline-comment-1",
+          "text": "offline fixture comment",
+          "author": "offline_author",
+          "timestamp": 1700000000,
+          "likes": 3,
+          "reply_previews": [
+            {
+              "id": "offline-reply-1",
+              "text": "offline fixture reply",
+              "author": "offline_replier",
+              "timestamp": 1700000001,
+              "likes": 1
+            }
+          ],
+          "parser_fields": [
+            "id",
+            "text",
+            "author",
+            "timestamp",
+            "likes",
+            "reply_previews"
+          ]
+        }
+      ]
+    },
+    {
+      "schema_version": 1,
+      "project": "InstaScrape",
+      "mode": "offline_fixture",
+      "target_url": "https://www.instagram.com/p/Dd9MKlfTDho/",
+      "request": {
+        "method": "GET",
+        "endpoint": "https://www.instagram.com/graphql/query/",
+        "query_hash": "97b41c52301f77ce508f55e66d17620e",
+        "variables": {
+          "shortcode": "Dd9MKlfTDho",
+          "first": 50
+        },
+        "attempts": 1
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "bytes": 499,
+        "json_parse_success": true,
+        "top_level_keys": [
+          "data"
+        ],
+        "shortcode_media_present": true,
+        "parent_comment_edge_present": true,
+        "comment_edges_present": true,
+        "comment_edge_count": 1,
+        "page_info_present": true,
+        "has_next_page": false,
+        "end_cursor_present": false,
+        "restriction": "none",
+        "error_message": null
+      },
+      "records_preview": [
+        {
+          "id": null,
+          "text": "offline fixture comment",
+          "author": "offline_author",
+          "timestamp": 1700000000,
+          "likes": null,
+          "reply_previews": null,
+          "parser_fields": [
+            "text",
+            "author",
+            "timestamp"
+          ]
+        }
+      ]
+    }
+  ],
+  "safety_checks": {
+    "instacomments": {
+      "request_count": 1,
+      "rate_limit_requests": 1,
+      "redirect_requests": 1,
+      "error_body_exposed": false
+    },
+    "InstaScrape": {
+      "request_count": 1,
+      "rate_limit_requests": 1,
+      "redirect_requests": 1,
+      "error_body_exposed": false
+    }
+  }
+}

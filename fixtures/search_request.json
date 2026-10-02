@@ -1,0 +1,36 @@
+{
+  "capture_kind": "request_only",
+  "method": "POST",
+  "origin": "https://www.instagram.com",
+  "path": "/api/graphql",
+  "operation": "PolarisSearchBoxRefetchableQuery",
+  "request_variables": {
+    "data": {
+      "context": "blended",
+      "include_reel": "true",
+      "query": "samsung",
+      "rank_token": "<redacted>",
+      "search_session_id": "<redacted>",
+      "search_surface": "web_top_search"
+    },
+    "hasQuery": true
+  },
+  "request_headers_present": [
+    "fb_api_req_friendly_name",
+    "x-fb-friendly-name",
+    "x-ig-app-id",
+    "x-csrftoken"
+  ],
+  "operation_id_present": true,
+  "authenticated_capture": true,
+  "response_captured": false,
+  "http_status": null,
+  "response_bytes": null,
+  "records": null,
+  "unique_ids": null,
+  "pages_traversed": null,
+  "pagination_termination": "UNTESTED",
+  "protocol_complete": "UNTESTED",
+  "reported_count_consistent": "UNTESTED",
+  "credential_material_removed": true
+}

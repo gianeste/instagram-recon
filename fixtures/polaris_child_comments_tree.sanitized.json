@@ -1,0 +1,105 @@
+{
+  "data": {
+    "xdt_api__v1__media__media_id__comments__parent_comment_id__child_comments__connection": {
+      "edges": [
+        {
+          "node": {
+            "pk": "18017716106933414",
+            "child_comment_count": null,
+            "restricted_status": null,
+            "has_translation": null,
+            "user": {
+              "pk": "76249532940",
+              "is_unpublished": false,
+              "profile_pic_url": "https://scontent-lga3-1.cdninstagram.com/v/t51.82787-19/669680792_17880662586540941_8701211015509288299_n.jpg",
+              "username": "wassim_onnri",
+              "id": "76249532940",
+              "is_verified": false,
+              "fbid_v2": "17841476228221191"
+            },
+            "has_liked_comment": false,
+            "text": "@meiyouroubuxing ur number one 🥀💔",
+            "giphy_media_info": null,
+            "created_at": 1789852777,
+            "is_edited": false,
+            "parent_comment_id": "18630157939026726",
+            "is_covered": false,
+            "fallback_user_info": null,
+            "comment_like_count": 0,
+            "__typename": "XDTCommentDict"
+          },
+          "cursor": ""
+        },
+        {
+          "node": {
+            "pk": "18140924464719266",
+            "child_comment_count": null,
+            "restricted_status": null,
+            "has_translation": null,
+            "user": {
+              "pk": "80504932090",
+              "is_unpublished": false,
+              "profile_pic_url": "https://scontent-lga3-3.cdninstagram.com/v/t51.82787-19/627062073_17845400070684091_5432950898860480129_n.jpg",
+              "username": "platypus.2106704",
+              "id": "80504932090",
+              "is_verified": false,
+              "fbid_v2": "17841480522713116"
+            },
+            "has_liked_comment": false,
+            "text": "@meiyouroubuxing yes number one girl❤️❤️❤️❤️",
+            "giphy_media_info": null,
+            "created_at": 1789865080,
+            "is_edited": false,
+            "parent_comment_id": "18630157939026726",
+            "is_covered": false,
+            "fallback_user_info": null,
+            "comment_like_count": 0,
+            "__typename": "XDTCommentDict"
+          },
+          "cursor": ""
+        },
+        {
+          "node": {
+            "pk": "18015411869743264",
+            "child_comment_count": null,
+            "restricted_status": null,
+            "has_translation": null,
+            "user": {
+              "pk": "80137468545",
+              "is_unpublished": false,
+              "profile_pic_url": "https://scontent-lga3-2.cdninstagram.com/v/t51.89012-19/573323465_1219825463302212_7278921664109726296_n.jpg",
+              "username": "zerappp7",
+              "id": "80137468545",
+              "is_verified": false,
+              "fbid_v2": "17841480056377183"
+            },
+            "has_liked_comment": false,
+            "text": "@meiyouroubuxing my love my love my love my love my love my love my love my love my love my love my love my love my everything my everything❤️❤️❤️❤️❤️",
+            "giphy_media_info": null,
+            "created_at": 1790165321,
+            "is_edited": false,
+            "parent_comment_id": "18630157939026726",
+            "is_covered": false,
+            "fallback_user_info": null,
+            "comment_like_count": 0,
+            "__typename": "XDTCommentDict"
+          },
+          "cursor": ""
+        }
+      ],
+      "page_info": {
+        "end_cursor": null,
+        "has_next_page": false,
+        "has_previous_page": false,
+        "start_cursor": null
+      }
+    }
+  },
+  "extensions": {
+    "server_metadata": {
+      "request_start_time_ms": 1790866213820,
+      "time_at_flush_ms": 1790866214160
+    },
+    "is_final": true
+  }
+}

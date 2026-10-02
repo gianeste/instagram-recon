@@ -1,0 +1,16 @@
+{
+  "operation": "PolarisPostChildCommentsQuery",
+  "verified": true,
+  "response_shape_fingerprint": "367241e0b9b6ec0e9a1e338675fd06ba533e372351afd91f644581cdf7919f15",
+  "items_path": "$.data.xdt_api__v1__media__media_id__comments__parent_comment_id__child_comments__connection.edges[*].node",
+  "fields": {
+    "id": "pk",
+    "parent_id": "parent_comment_id",
+    "author_id": "user.pk",
+    "author_username": "user.username",
+    "text": "text",
+    "timestamp": "created_at",
+    "like_count": "comment_like_count",
+    "reply_count": "child_comment_count"
+  }
+}

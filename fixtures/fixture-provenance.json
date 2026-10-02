@@ -1,0 +1,60 @@
+{
+  "fixtures/polaris_child_comments_tree.sanitized.json": {
+    "provenance": "imported_external",
+    "source_artifact": "tree.txt",
+    "captured_by_this_utility": false,
+    "request_metadata_retained": false,
+    "response_role": "child_reply_page_role_unknown_terminal_shape_observed",
+    "schema_validated": true,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  },
+  "fixtures/polaris_child_comments_mapping.json": {
+    "provenance": "reviewed_mapping",
+    "source_fixture": "fixtures/polaris_child_comments_tree.sanitized.json",
+    "schema_validated": true,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  },
+  "fixtures/instagram_root_comments_browser.schema.json": {
+    "provenance": "genuine_authorized_browser_dom_response_schema_projection",
+    "source_artifact": "Edge browser tab DOM for a root-comment continuation response",
+    "captured_by_this_utility": false,
+    "request_metadata_retained": false,
+    "response_role": "root_comment_continuation_page",
+    "schema_validated": true,
+    "pagination_validated": false,
+    "pagination_evaluator_status": "CONTINUE",
+    "live_collection_qualified": false
+  },
+  "fixtures/instagram_root_comments_mapping.json": {
+    "provenance": "reviewed_mapping",
+    "source_fixture": "fixtures/instagram_root_comments_browser.schema.json",
+    "schema_validated": true,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  },
+  "fixtures/search_request.json": {
+    "provenance": "sanitized_request_shape",
+    "response_fixture": false,
+    "schema_validated": false,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  },
+  "data/Dd6m2a6Exca/browser_observation.json": {
+    "provenance": "browser_ui_observation",
+    "response_fixture": false,
+    "schema_validated": false,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  },
+  "data/instagram-probe/ui-continuation-observation.json": {
+    "provenance": "genuine_authorized_browser_ui_observation",
+    "response_fixture": false,
+    "network_operation_observed": false,
+    "ui_lazy_content_observed": true,
+    "schema_validated": false,
+    "pagination_validated": false,
+    "live_collection_qualified": false
+  }
+}
